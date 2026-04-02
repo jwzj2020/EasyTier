@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::{net::SocketAddr, pin::Pin};
 
 use bytes::BytesMut;
-use pnet::datalink;
+use network_interface::NetworkInterfaceConfig;
 use pnet::util::MacAddr;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -34,11 +34,18 @@ impl IpToIfNameCache {
 
     fn reload_ip_to_ifname(&self) {
         self.ip_to_ifname.clear();
-        let interfaces = datalink::interfaces();
+        let Ok(interfaces) = network_interface::NetworkInterface::show() else {
+            tracing::warn!("failed to enumerate interfaces when reloading faketcp ip cache");
+            return;
+        };
         for iface in interfaces {
-            for ip in iface.ips.iter() {
-                self.ip_to_ifname
-                    .insert(ip.ip(), (iface.name.clone(), iface.mac));
+            let mac = iface.mac_addr.as_deref().and_then(|mac| {
+                mac.parse::<MacAddr>().map_err(|e| {
+                    tracing::debug!(iface = %iface.name, mac, ?e, "failed to parse interface mac")
+                }).ok()
+            });
+            for ip in iface.addr.iter() {
+                self.ip_to_ifname.insert(ip.ip(), (iface.name.clone(), mac));
             }
         }
     }
@@ -55,6 +62,17 @@ impl IpToIfNameCache {
 
 fn get_faketcp_tunnel_type_str(driver_type: &str) -> String {
     format!("faketcp_{}", driver_type)
+}
+
+async fn create_tun_off_runtime(
+    interface_name: String,
+    src_addr: Option<SocketAddr>,
+    dst_addr: SocketAddr,
+) -> Result<Arc<dyn stack::Tun>, TunnelError> {
+    tokio::task::spawn_blocking(move || create_tun(&interface_name, src_addr, dst_addr))
+        .await
+        .map_err(|e| TunnelError::InternalError(format!("faketcp create_tun task failed: {e}")))?
+        .map_err(Into::into)
 }
 
 pub struct FakeTcpTunnelListener {
@@ -137,7 +155,9 @@ impl FakeTcpTunnelListener {
         let ret = match self.stack_map.entry(interface_name.to_string()) {
             dashmap::Entry::Occupied(entry) => entry.get().clone(),
             dashmap::Entry::Vacant(entry) => {
-                let tun = create_tun(interface_name, None, local_socket_addr)?;
+                let tun =
+                    create_tun_off_runtime(interface_name.to_string(), None, local_socket_addr)
+                        .await?;
                 tracing::info!(
                     ?local_socket_addr,
                     "create new stack with interface_name: {:?}",
@@ -314,7 +334,8 @@ impl crate::tunnel::TunnelConnector for FakeTcpTunnelConnector {
             IpAddr::V6(ip) => (None, Some(ip)),
         };
 
-        let tun = create_tun(&interface_name, Some(remote_addr), local_addr)?;
+        let tun =
+            create_tun_off_runtime(interface_name.clone(), Some(remote_addr), local_addr).await?;
         let local_ip = local_ip.unwrap_or("0.0.0.0".parse().unwrap());
         let mut stack = stack::Stack::new(tun, local_ip, local_ip6, mac);
         let driver_type = stack.driver_type();
@@ -366,7 +387,9 @@ impl crate::tunnel::TunnelConnector for FakeTcpTunnelConnector {
     }
 }
 
-use crate::tunnel::packet_def::{ZCPacket, ZCPacketType};
+use crate::tunnel::packet_def::{
+    ZCPacket, ZCPacketType, PEER_MANAGER_HEADER_SIZE, TCP_TUNNEL_HEADER_SIZE,
+};
 use crate::tunnel::{SinkError, SinkItem, StreamItem};
 use futures::{Sink, Stream};
 use std::task::{Context as TaskContext, Poll};
@@ -407,7 +430,18 @@ impl Stream for FakeTcpStream {
                     let packet = ZCPacket::new_from_buf(buf, ZCPacketType::TCP);
                     if let Some(tcp_hdr) = packet.tcp_tunnel_header() {
                         let expected_payload_len = tcp_hdr.len.get() as usize;
-                        if expected_payload_len <= buf_len && expected_payload_len != 0 {
+                        let min_packet_len = TCP_TUNNEL_HEADER_SIZE + PEER_MANAGER_HEADER_SIZE;
+                        if expected_payload_len < min_packet_len {
+                            tracing::warn!(
+                                "drop fake tcp packet with invalid length: expected_payload_len={}, min_required={}",
+                                expected_payload_len,
+                                min_packet_len
+                            );
+                            s.state = FakeTcpStreamState::Closed;
+                            return Poll::Ready(None);
+                        }
+
+                        if expected_payload_len <= buf_len {
                             let mut buf = packet.inner();
                             let new_inner = buf.split_to(expected_payload_len);
                             s.state = FakeTcpStreamState::ConsumingBuf(buf);

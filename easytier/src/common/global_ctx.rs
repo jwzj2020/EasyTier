@@ -1,14 +1,21 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::{
     hash::Hasher,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
+
 use crate::common::config::ProxyNetworkConfig;
+use crate::common::shrink_dashmap;
 use crate::common::stats_manager::StatsManager;
 use crate::common::token_bucket::TokenBucketManager;
 use crate::peers::acl_filter::AclFilter;
+use crate::peers::credential_manager::CredentialManager;
 use crate::proto::acl::GroupIdentity;
 use crate::proto::api::config::InstanceConfigPatch;
 use crate::proto::api::instance::PeerConnInfo;
@@ -59,10 +66,120 @@ pub enum GlobalCtxEvent {
     ConfigPatched(InstanceConfigPatch),
 
     ProxyCidrsUpdated(Vec<cidr::Ipv4Cidr>, Vec<cidr::Ipv4Cidr>), // (added, removed)
+
+    CredentialChanged,
 }
 
 pub type EventBus = tokio::sync::broadcast::Sender<GlobalCtxEvent>;
 pub type EventBusSubscriber = tokio::sync::broadcast::Receiver<GlobalCtxEvent>;
+
+/// Source of a trusted public key from OSPF route propagation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustedKeySource {
+    /// Peer node's noise static pubkey
+    OspfNode,
+    /// Admin-declared trusted credential pubkey
+    OspfCredential,
+}
+
+/// Metadata for a trusted public key
+#[derive(Debug, Clone)]
+pub struct TrustedKeyMetadata {
+    pub source: TrustedKeySource,
+    /// Expiry time in Unix seconds. None means never expires.
+    pub expiry_unix: Option<i64>,
+}
+
+impl TrustedKeyMetadata {
+    pub fn is_expired(&self) -> bool {
+        if let Some(expiry) = self.expiry_unix {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            return now >= expiry;
+        }
+        false
+    }
+}
+
+// key is (pubkey, network-name)
+pub type TrustedKeyMap = HashMap<Vec<u8>, TrustedKeyMetadata>;
+
+struct TrustedKeyMapManager {
+    network_trusted_keys: DashMap<String, ArcSwap<TrustedKeyMap>>,
+}
+
+impl TrustedKeyMapManager {
+    pub fn new() -> Self {
+        Self {
+            network_trusted_keys: DashMap::new(),
+        }
+    }
+
+    pub fn update_trusted_keys(&self, network_name: &str, trusted_keys: TrustedKeyMap) {
+        match self.network_trusted_keys.entry(network_name.to_string()) {
+            dashmap::Entry::Vacant(entry) => {
+                entry.insert(ArcSwap::new(Arc::new(trusted_keys)));
+            }
+            dashmap::Entry::Occupied(entry) => {
+                entry.get().store(Arc::new(trusted_keys));
+            }
+        }
+    }
+
+    pub fn remove_trusted_keys(&self, network_name: &str) {
+        self.network_trusted_keys.remove(network_name);
+        shrink_dashmap(&self.network_trusted_keys, None);
+    }
+
+    pub fn verify_trusted_key(&self, pubkey: &[u8], network_name: &str) -> bool {
+        self.verify_trusted_key_with_source(pubkey, network_name, None)
+    }
+
+    pub fn verify_trusted_key_with_source(
+        &self,
+        pubkey: &[u8],
+        network_name: &str,
+        source: Option<TrustedKeySource>,
+    ) -> bool {
+        let Some(trusted_keys) = self
+            .network_trusted_keys
+            .get(network_name)
+            .map(|v| v.load_full())
+        else {
+            return false;
+        };
+
+        let Some(metadata) = trusted_keys.get(&pubkey.to_vec()) else {
+            return false;
+        };
+
+        if let Some(source) = source {
+            metadata.source == source && !metadata.is_expired()
+        } else {
+            !metadata.is_expired()
+        }
+    }
+
+    pub fn list_trusted_keys(&self, network_name: &str) -> Vec<(Vec<u8>, TrustedKeyMetadata)> {
+        let Some(trusted_keys) = self
+            .network_trusted_keys
+            .get(network_name)
+            .map(|v| v.load_full())
+        else {
+            return Vec::new();
+        };
+
+        let mut items = trusted_keys
+            .iter()
+            .filter(|(_, metadata)| !metadata.is_expired())
+            .map(|(pubkey, metadata)| (pubkey.clone(), metadata.clone()))
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.0.cmp(&right.0));
+        items
+    }
+}
 
 pub struct GlobalCtx {
     pub inst_name: String,
@@ -85,10 +202,7 @@ pub struct GlobalCtx {
 
     running_listeners: Mutex<Vec<url::Url>>,
 
-    enable_exit_node: bool,
-    proxy_forward_by_system: bool,
-    no_tun: bool,
-    p2p_only: bool,
+    flags: ArcSwap<Flags>,
 
     feature_flags: AtomicCell<PeerFeatureFlag>,
 
@@ -97,6 +211,12 @@ pub struct GlobalCtx {
     stats_manager: Arc<StatsManager>,
 
     acl_filter: Arc<AclFilter>,
+
+    credential_manager: Arc<CredentialManager>,
+
+    /// OSPF propagated trusted keys (peer pubkeys and admin credentials)
+    /// Stored in ArcSwap for lock-free reads and atomic batch updates
+    trusted_keys: Arc<TrustedKeyMapManager>,
 }
 
 impl std::fmt::Debug for GlobalCtx {
@@ -114,6 +234,17 @@ impl std::fmt::Debug for GlobalCtx {
 pub type ArcGlobalCtx = std::sync::Arc<GlobalCtx>;
 
 impl GlobalCtx {
+    fn derive_feature_flags(flags: &Flags, current: Option<PeerFeatureFlag>) -> PeerFeatureFlag {
+        let mut feature_flags = current.unwrap_or_default();
+        feature_flags.kcp_input = !flags.disable_kcp_input;
+        feature_flags.no_relay_kcp = flags.disable_relay_kcp;
+        feature_flags.support_conn_list_sync = true;
+        feature_flags.quic_input = !flags.disable_quic_input;
+        feature_flags.no_relay_quic = flags.disable_relay_quic;
+        feature_flags.need_p2p = flags.need_p2p;
+        feature_flags
+    }
+
     pub fn new(config_fs: impl ConfigLoader + 'static) -> Self {
         let id = config_fs.get_id();
         let network = config_fs.get_network_identity();
@@ -138,19 +269,12 @@ impl GlobalCtx {
 
         let stun_info_collector = Arc::new(stun_info_collector);
 
-        let enable_exit_node = config_fs.get_flags().enable_exit_node || cfg!(target_env = "ohos");
-        let proxy_forward_by_system = config_fs.get_flags().proxy_forward_by_system;
-        let no_tun = config_fs.get_flags().no_tun;
-        let p2p_only = config_fs.get_flags().p2p_only;
+        let flags = config_fs.get_flags();
 
-        let feature_flags = PeerFeatureFlag {
-            kcp_input: !config_fs.get_flags().disable_kcp_input,
-            no_relay_kcp: config_fs.get_flags().disable_relay_kcp,
-            support_conn_list_sync: true, // Enable selective peer list sync by default
-            quic_input: !config_fs.get_flags().disable_quic_input,
-            no_relay_quic: config_fs.get_flags().disable_relay_quic,
-            ..Default::default()
-        };
+        let feature_flags = Self::derive_feature_flags(&flags, None);
+
+        let credential_storage_path = config_fs.get_credential_file();
+        let credential_manager = Arc::new(CredentialManager::new(credential_storage_path));
 
         GlobalCtx {
             inst_name: config_fs.get_inst_name(),
@@ -175,10 +299,7 @@ impl GlobalCtx {
 
             running_listeners: Mutex::new(Vec::new()),
 
-            enable_exit_node,
-            proxy_forward_by_system,
-            no_tun,
-            p2p_only,
+            flags: ArcSwap::new(Arc::new(flags)),
 
             feature_flags: AtomicCell::new(feature_flags),
 
@@ -187,6 +308,10 @@ impl GlobalCtx {
             stats_manager: Arc::new(StatsManager::new()),
 
             acl_filter: Arc::new(AclFilter::new()),
+
+            credential_manager,
+
+            trusted_keys: Arc::new(TrustedKeyMapManager::new()),
         }
     }
 
@@ -325,11 +450,20 @@ impl GlobalCtx {
     }
 
     pub fn get_flags(&self) -> Flags {
-        self.config.get_flags()
+        self.flags.load().as_ref().clone()
     }
 
     pub fn set_flags(&self, flags: Flags) {
-        self.config.set_flags(flags);
+        self.config.set_flags(flags.clone());
+        self.feature_flags.store(Self::derive_feature_flags(
+            &flags,
+            Some(self.feature_flags.load()),
+        ));
+        self.flags.store(Arc::new(flags));
+    }
+
+    pub fn flags_arc(&self) -> Arc<Flags> {
+        self.flags.load_full()
     }
 
     pub fn get_128_key(&self) -> [u8; 16] {
@@ -373,15 +507,15 @@ impl GlobalCtx {
     }
 
     pub fn enable_exit_node(&self) -> bool {
-        self.enable_exit_node
+        self.flags.load().enable_exit_node || cfg!(target_env = "ohos")
     }
 
     pub fn proxy_forward_by_system(&self) -> bool {
-        self.proxy_forward_by_system
+        self.flags.load().proxy_forward_by_system
     }
 
     pub fn no_tun(&self) -> bool {
-        self.no_tun
+        self.flags.load().no_tun
     }
 
     pub fn get_feature_flags(&self) -> PeerFeatureFlag {
@@ -402,6 +536,51 @@ impl GlobalCtx {
 
     pub fn get_acl_filter(&self) -> &Arc<AclFilter> {
         &self.acl_filter
+    }
+
+    pub fn get_credential_manager(&self) -> &Arc<CredentialManager> {
+        &self.credential_manager
+    }
+
+    /// Check if a public key is trusted using two-level lookup:
+    /// 1. OSPF propagated trusted_keys (lock-free)
+    /// 2. Local credential_manager
+    pub fn is_pubkey_trusted(&self, pubkey: &[u8], network_name: &str) -> bool {
+        // First level: check OSPF propagated keys (lock-free)
+        if self.trusted_keys.verify_trusted_key(pubkey, network_name) {
+            return true;
+        }
+
+        // Second level: check local credential_manager if in the same network
+        if network_name == self.get_network_name() {
+            return self.credential_manager.is_pubkey_trusted(pubkey);
+        }
+
+        false
+    }
+
+    pub fn is_pubkey_trusted_with_source(
+        &self,
+        pubkey: &[u8],
+        network_name: &str,
+        source: TrustedKeySource,
+    ) -> bool {
+        self.trusted_keys
+            .verify_trusted_key_with_source(pubkey, network_name, Some(source))
+    }
+
+    /// Atomically replace all OSPF trusted keys with a new set
+    /// Called by OSPF route layer after each route update
+    pub fn update_trusted_keys(&self, keys: TrustedKeyMap, network_name: &str) {
+        self.trusted_keys.update_trusted_keys(network_name, keys);
+    }
+
+    pub fn remove_trusted_keys(&self, network_name: &str) {
+        self.trusted_keys.remove_trusted_keys(network_name);
+    }
+
+    pub fn list_trusted_keys(&self, network_name: &str) -> Vec<(Vec<u8>, TrustedKeyMetadata)> {
+        self.trusted_keys.list_trusted_keys(network_name)
     }
 
     pub fn get_acl_groups(&self, peer_id: PeerId) -> Vec<PeerGroupInfo> {
@@ -436,12 +615,13 @@ impl GlobalCtx {
     }
 
     pub fn p2p_only(&self) -> bool {
-        self.p2p_only
+        self.flags.load().p2p_only
     }
 
     pub fn latency_first(&self) -> bool {
         // NOTICE: p2p only is conflict with latency first
-        self.config.get_flags().latency_first && !self.p2p_only
+        let flags = self.flags.load();
+        flags.latency_first && !flags.p2p_only
     }
 
     fn is_port_in_running_listeners(&self, port: u16, is_udp: bool) -> bool {
@@ -522,6 +702,66 @@ pub mod tests {
             subscriber.recv().await.unwrap(),
             GlobalCtxEvent::PeerConnRemoved(PeerConnInfo::default())
         );
+    }
+
+    #[tokio::test]
+    async fn trusted_key_source_lookup_is_precise() {
+        let config = TomlConfigLoader::default();
+        let global_ctx = GlobalCtx::new(config);
+        let network_name = "net1";
+        let pubkey = vec![1; 32];
+
+        global_ctx.update_trusted_keys(
+            HashMap::from([(
+                pubkey.clone(),
+                TrustedKeyMetadata {
+                    source: TrustedKeySource::OspfCredential,
+                    expiry_unix: None,
+                },
+            )]),
+            network_name,
+        );
+
+        assert!(global_ctx.is_pubkey_trusted(&pubkey, network_name));
+        assert!(!global_ctx.is_pubkey_trusted_with_source(
+            &pubkey,
+            network_name,
+            TrustedKeySource::OspfNode,
+        ));
+        assert!(global_ctx.is_pubkey_trusted_with_source(
+            &pubkey,
+            network_name,
+            TrustedKeySource::OspfCredential,
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_flags_keeps_derived_feature_flags_in_sync() {
+        let config = TomlConfigLoader::default();
+        let global_ctx = GlobalCtx::new(config);
+
+        let mut feature_flags = global_ctx.get_feature_flags();
+        feature_flags.avoid_relay_data = true;
+        feature_flags.is_public_server = true;
+        global_ctx.set_feature_flags(feature_flags);
+
+        let mut flags = global_ctx.get_flags();
+        flags.disable_kcp_input = true;
+        flags.disable_relay_kcp = true;
+        flags.disable_quic_input = true;
+        flags.disable_relay_quic = true;
+        flags.need_p2p = true;
+        global_ctx.set_flags(flags);
+
+        let feature_flags = global_ctx.get_feature_flags();
+        assert!(!feature_flags.kcp_input);
+        assert!(feature_flags.no_relay_kcp);
+        assert!(!feature_flags.quic_input);
+        assert!(feature_flags.no_relay_quic);
+        assert!(feature_flags.need_p2p);
+        assert!(feature_flags.support_conn_list_sync);
+        assert!(feature_flags.avoid_relay_data);
+        assert!(feature_flags.is_public_server);
     }
 
     pub fn get_mock_global_ctx_with_network(

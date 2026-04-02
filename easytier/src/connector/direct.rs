@@ -2,13 +2,13 @@
 
 use std::{
     collections::HashSet,
-    net::{Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -40,7 +40,10 @@ use rand::Rng;
 use tokio::{net::UdpSocket, task::JoinSet, time::timeout};
 use url::Host;
 
-use super::{create_connector_by_url, udp_hole_punch};
+use super::{
+    create_connector_by_url, should_background_p2p_with_peer, should_try_p2p_with_peer,
+    udp_hole_punch,
+};
 
 pub const DIRECT_CONNECTOR_SERVICE_ID: u32 = 1;
 pub const DIRECT_CONNECTOR_BLACKLIST_TIMEOUT_SEC: u64 = 300;
@@ -58,14 +61,22 @@ impl PeerManagerForDirectConnector for PeerManager {
     async fn list_peers(&self) -> Vec<PeerId> {
         let mut ret = vec![];
         let allow_public_server = use_global_var!(DIRECT_CONNECT_TO_PUBLIC_SERVER);
+        let lazy_p2p = self.get_global_ctx().get_flags().lazy_p2p;
+        let now = Instant::now();
 
         let routes = self.list_routes().await;
-        for r in routes.iter().filter(|r| {
-            r.feature_flag
-                .map(|r| allow_public_server || !r.is_public_server)
-                .unwrap_or(true)
-        }) {
-            ret.push(r.peer_id);
+        for route in routes.iter() {
+            let static_allowed = should_background_p2p_with_peer(
+                route.feature_flag.as_ref(),
+                allow_public_server,
+                lazy_p2p,
+            );
+            let dynamic_allowed =
+                should_try_p2p_with_peer(route.feature_flag.as_ref(), allow_public_server)
+                    && self.has_recent_traffic(route.peer_id, now);
+            if static_allowed || dynamic_allowed {
+                ret.push(route.peer_id);
+            }
         }
 
         ret
@@ -294,14 +305,42 @@ impl DirectConnectorManagerData {
         };
         let listener_host = addrs.pop();
         tracing::info!(?listener_host, ?listener, "try direct connect to peer");
+
+        let is_udp = matches!(listener.scheme(), "udp" | "wg");
+        // Snapshot running listeners once; used for cheap port pre-checks before the
+        // expensive should_deny_proxy call (which binds a socket per IP) in the
+        // unspecified-address expansion loops below.
+        let local_listeners = self.global_ctx.get_running_listeners();
+        let port_has_local_listener = |port: u16| -> bool {
+            local_listeners
+                .iter()
+                .any(|l| l.port() == Some(port) && (matches!(l.scheme(), "udp" | "wg") == is_udp))
+        };
+
         match listener_host {
             Some(SocketAddr::V4(s_addr)) => {
                 if s_addr.ip().is_unspecified() {
+                    // Only pay the should_deny_proxy cost (bind per IP) when a local
+                    // listener actually uses this port+protocol; otherwise the check
+                    // can never return true.
+                    let check_self = port_has_local_listener(s_addr.port());
                     ip_list
                         .interface_ipv4s
                         .iter()
                         .chain(ip_list.public_ipv4.iter())
                         .for_each(|ip| {
+                            let sock_addr = SocketAddr::new(
+                                IpAddr::V4(std::net::Ipv4Addr::from(ip.addr)),
+                                s_addr.port(),
+                            );
+                            if check_self && self.global_ctx.should_deny_proxy(&sock_addr, is_udp) {
+                                tracing::debug!(
+                                    ?ip,
+                                    ?listener,
+                                    "skip self-connection (0.0.0.0 expansion)"
+                                );
+                                return;
+                            }
                             let mut addr = (*listener).clone();
                             if addr.set_host(Some(ip.to_string().as_str())).is_ok() {
                                 tasks.spawn(Self::try_connect_to_ip(
@@ -319,16 +358,26 @@ impl DirectConnectorManagerData {
                             }
                         });
                 } else if !s_addr.ip().is_loopback() || TESTING.load(Ordering::Relaxed) {
-                    tasks.spawn(Self::try_connect_to_ip(
-                        self.clone(),
-                        dst_peer_id,
-                        listener.to_string(),
-                    ));
+                    if self
+                        .global_ctx
+                        .should_deny_proxy(&SocketAddr::from(s_addr), is_udp)
+                    {
+                        tracing::debug!(?listener, "skip self-connection (specific IPv4)");
+                    } else {
+                        tasks.spawn(Self::try_connect_to_ip(
+                            self.clone(),
+                            dst_peer_id,
+                            listener.to_string(),
+                        ));
+                    }
                 }
             }
             Some(SocketAddr::V6(s_addr)) => {
                 if s_addr.ip().is_unspecified() {
                     // for ipv6, only try public ip
+                    // Same port pre-check as IPv4: avoid binding per IP when no local
+                    // listener uses this port+protocol.
+                    let check_self = port_has_local_listener(s_addr.port());
                     ip_list
                         .interface_ipv6s
                         .iter()
@@ -345,6 +394,15 @@ impl DirectConnectorManagerData {
                         .collect::<HashSet<_>>()
                         .iter()
                         .for_each(|ip| {
+                            let sock_addr = SocketAddr::new(IpAddr::V6(*ip), s_addr.port());
+                            if check_self && self.global_ctx.should_deny_proxy(&sock_addr, is_udp) {
+                                tracing::debug!(
+                                    ?ip,
+                                    ?listener,
+                                    "skip self-connection (:: expansion)"
+                                );
+                                return;
+                            }
                             let mut addr = (*listener).clone();
                             if addr.set_host(Some(format!("[{}]", ip).as_str())).is_ok() {
                                 tasks.spawn(Self::try_connect_to_ip(
@@ -362,11 +420,18 @@ impl DirectConnectorManagerData {
                             }
                         });
                 } else if !s_addr.ip().is_loopback() || TESTING.load(Ordering::Relaxed) {
-                    tasks.spawn(Self::try_connect_to_ip(
-                        self.clone(),
-                        dst_peer_id,
-                        listener.to_string(),
-                    ));
+                    if self
+                        .global_ctx
+                        .should_deny_proxy(&SocketAddr::from(s_addr), is_udp)
+                    {
+                        tracing::debug!(?listener, "skip self-connection (specific IPv6)");
+                    } else {
+                        tasks.spawn(Self::try_connect_to_ip(
+                            self.clone(),
+                            dst_peer_id,
+                            listener.to_string(),
+                        ));
+                    }
                 }
             }
             p => {
@@ -571,7 +636,11 @@ impl DirectConnectorManager {
             global_ctx.clone(),
             peer_manager.clone(),
         ));
-        let client = PeerTaskManager::new(DirectConnectorLauncher(data.clone()), peer_manager);
+        let client = PeerTaskManager::new_with_external_signal(
+            DirectConnectorLauncher(data.clone()),
+            peer_manager.clone(),
+            Some(peer_manager.p2p_demand_notify()),
+        );
         Self {
             global_ctx,
             data,
@@ -642,7 +711,7 @@ mod tests {
 
         let mut f = p_a.get_global_ctx().get_flags();
         f.bind_device = false;
-        p_a.get_global_ctx().config.set_flags(f);
+        p_a.get_global_ctx().set_flags(f);
 
         p_c.get_global_ctx()
             .config
@@ -711,7 +780,7 @@ mod tests {
         }
         let mut f = p_c.get_global_ctx().config.get_flags();
         f.enable_ipv6 = ipv6;
-        p_c.get_global_ctx().config.set_flags(f);
+        p_c.get_global_ctx().set_flags(f);
         let mut lis_c = ListenerManager::new(p_c.get_global_ctx(), p_c.clone());
         lis_c.prepare_listeners().await.unwrap();
 

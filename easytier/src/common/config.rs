@@ -6,7 +6,12 @@ use std::{
 };
 
 use anyhow::Context;
+use base64::{prelude::BASE64_STANDARD, Engine as _};
+use cfg_if::cfg_if;
+use clap::builder::PossibleValue;
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use strum::{Display, EnumString, VariantArray};
 use tokio::io::AsyncReadExt as _;
 
 use crate::{
@@ -39,6 +44,7 @@ pub fn gen_default_flags() -> Flags {
         relay_network_whitelist: "*".to_string(),
         disable_p2p: false,
         p2p_only: false,
+        lazy_p2p: false,
         relay_all_peer_rpc: false,
         disable_tcp_hole_punching: false,
         disable_udp_hole_punching: false,
@@ -57,81 +63,61 @@ pub fn gen_default_flags() -> Flags {
         enable_relay_foreign_network_quic: false,
         foreign_relay_bps_limit: u64::MAX,
         multi_thread_count: 2,
-        encryption_algorithm: "aes-gcm".to_string(),
+        encryption_algorithm: EncryptionAlgorithm::default().to_string(),
         disable_sym_hole_punching: false,
         tld_dns_zone: DEFAULT_ET_DNS_ZONE.to_string(),
 
         quic_listen_port: u32::MAX,
+        need_p2p: false,
+        instance_recv_bps_limit: u64::MAX,
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Display, EnumString, VariantArray)]
+#[strum(ascii_case_insensitive)]
 pub enum EncryptionAlgorithm {
-    AesGcm,
-    Aes256Gcm,
+    #[strum(serialize = "xor")]
     Xor,
-    #[cfg(feature = "wireguard")]
+
+    #[cfg(any(feature = "aes-gcm", feature = "wireguard", feature = "openssl-crypto"))]
+    #[strum(serialize = "aes-gcm")]
+    AesGcm,
+    #[cfg(any(feature = "aes-gcm", feature = "wireguard", feature = "openssl-crypto"))]
+    #[strum(serialize = "aes-256-gcm")]
+    Aes256Gcm,
+    #[cfg(any(feature = "wireguard", feature = "openssl-crypto"))]
+    #[strum(serialize = "chacha20")]
     ChaCha20,
-
-    #[cfg(feature = "openssl-crypto")]
-    OpensslAesGcm,
-    #[cfg(feature = "openssl-crypto")]
-    OpensslChacha20,
-    #[cfg(feature = "openssl-crypto")]
-    OpensslAes256Gcm,
 }
 
-impl std::fmt::Display for EncryptionAlgorithm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AesGcm => write!(f, "aes-gcm"),
-            Self::Aes256Gcm => write!(f, "aes-256-gcm"),
-            Self::Xor => write!(f, "xor"),
-            #[cfg(feature = "wireguard")]
-            Self::ChaCha20 => write!(f, "chacha20"),
-            #[cfg(feature = "openssl-crypto")]
-            Self::OpensslAesGcm => write!(f, "openssl-aes-gcm"),
-            #[cfg(feature = "openssl-crypto")]
-            Self::OpensslChacha20 => write!(f, "openssl-chacha20"),
-            #[cfg(feature = "openssl-crypto")]
-            Self::OpensslAes256Gcm => write!(f, "openssl-aes-256-gcm"),
+impl ValueEnum for EncryptionAlgorithm {
+    fn value_variants<'a>() -> &'a [Self] {
+        Self::VARIANTS
+    }
+
+    fn from_str(input: &str, _ignore_case: bool) -> Result<Self, String> {
+        input
+            .parse()
+            .map_err(|_| format!("'{}' is not a valid encryption algorithm", input))
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        Some(PossibleValue::new(self.to_string()))
+    }
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for EncryptionAlgorithm {
+    fn default() -> Self {
+        cfg_if! {
+            if #[cfg(any(feature = "aes-gcm", feature = "wireguard", feature = "openssl-crypto"))] {
+                EncryptionAlgorithm::AesGcm
+            } else {
+                crate::common::log::warn!("no AEAD encryption algorithm is available, using INSECURE XOR");
+                EncryptionAlgorithm::Xor
+            }
         }
     }
-}
-
-impl TryFrom<&str> for EncryptionAlgorithm {
-    type Error = anyhow::Error;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "aes-gcm" => Ok(Self::AesGcm),
-            "aes-256-gcm" => Ok(Self::Aes256Gcm),
-            "xor" => Ok(Self::Xor),
-            #[cfg(feature = "wireguard")]
-            "chacha20" => Ok(Self::ChaCha20),
-            #[cfg(feature = "openssl-crypto")]
-            "openssl-aes-gcm" => Ok(Self::OpensslAesGcm),
-            #[cfg(feature = "openssl-crypto")]
-            "openssl-chacha20" => Ok(Self::OpensslChacha20),
-            #[cfg(feature = "openssl-crypto")]
-            "openssl-aes-256-gcm" => Ok(Self::OpensslAes256Gcm),
-            _ => Err(anyhow::anyhow!("invalid encryption algorithm")),
-        }
-    }
-}
-
-pub fn get_avaliable_encrypt_methods() -> Vec<&'static str> {
-    let mut r = vec!["aes-gcm", "aes-256-gcm", "xor"];
-    if cfg!(feature = "wireguard") {
-        r.push("chacha20");
-    }
-    if cfg!(feature = "openssl-crypto") {
-        r.extend(vec![
-            "openssl-aes-gcm",
-            "openssl-chacha20",
-            "openssl-aes-256-gcm",
-        ]);
-    }
-    r
 }
 
 #[auto_impl::auto_impl(Box, &)]
@@ -216,6 +202,11 @@ pub trait ConfigLoader: Send + Sync {
     fn get_secure_mode(&self) -> Option<SecureModeConfig>;
     fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>);
 
+    fn get_credential_file(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+    fn set_credential_file(&self, _path: Option<std::path::PathBuf>) {}
+
     fn dump(&self) -> String;
 }
 
@@ -294,6 +285,16 @@ impl NetworkIdentity {
             network_name,
             network_secret: Some(network_secret),
             network_secret_digest: Some(network_secret_digest),
+        }
+    }
+
+    /// Create a NetworkIdentity for a credential node (no network_secret).
+    /// The node identifies by network_name only and authenticates via credential keypair.
+    pub fn new_credential(network_name: String) -> Self {
+        NetworkIdentity {
+            network_name,
+            network_secret: None,
+            network_secret_digest: None,
         }
     }
 }
@@ -390,6 +391,42 @@ impl From<PortForwardConfig> for PortForwardConfigPb {
     }
 }
 
+pub fn process_secure_mode_cfg(mut user_cfg: SecureModeConfig) -> anyhow::Result<SecureModeConfig> {
+    if !user_cfg.enabled {
+        return Ok(user_cfg);
+    }
+
+    let private_key = if user_cfg.local_private_key.is_none() {
+        // if no private key, generate random one
+        let private = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        user_cfg.local_private_key = Some(BASE64_STANDARD.encode(private.clone().as_bytes()));
+        private
+    } else {
+        // check if private key is valid
+        user_cfg.private_key()?
+    };
+
+    let public = x25519_dalek::PublicKey::from(&private_key);
+
+    match user_cfg.local_public_key {
+        None => {
+            user_cfg.local_public_key = Some(BASE64_STANDARD.encode(public.as_bytes()));
+        }
+        Some(ref user_pub) => {
+            let public = user_cfg.public_key()?;
+            if *user_pub != BASE64_STANDARD.encode(public.as_bytes()) {
+                return Err(anyhow::anyhow!(
+                    "local public key {} does not match generated public key {}",
+                    user_pub,
+                    BASE64_STANDARD.encode(public.as_bytes())
+                ));
+            }
+        }
+    }
+
+    Ok(user_cfg)
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct Config {
     netns: Option<String>,
@@ -428,6 +465,8 @@ struct Config {
     udp_whitelist: Option<Vec<String>>,
     stun_servers: Option<Vec<String>>,
     stun_servers_v6: Option<Vec<String>>,
+
+    credential_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -819,6 +858,14 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>) {
         self.config.lock().unwrap().secure_mode = secure_mode;
+    }
+
+    fn get_credential_file(&self) -> Option<PathBuf> {
+        self.config.lock().unwrap().credential_file.clone()
+    }
+
+    fn set_credential_file(&self, path: Option<PathBuf>) {
+        self.config.lock().unwrap().credential_file = path;
     }
 
     fn dump(&self) -> String {

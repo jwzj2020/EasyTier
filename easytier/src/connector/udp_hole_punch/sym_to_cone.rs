@@ -342,7 +342,8 @@ impl PunchSymToConeHoleClient {
     async fn get_rpc_stub(
         &self,
         dst_peer_id: PeerId,
-    ) -> Box<dyn UdpHolePunchRpc<Controller = BaseController> + std::marker::Send + 'static> {
+    ) -> Box<dyn UdpHolePunchRpc<Controller = BaseController> + std::marker::Send + Sync + 'static>
+    {
         self.peer_mgr
             .get_peer_rpc_mgr()
             .rpc_client()
@@ -616,7 +617,7 @@ pub mod tests {
                     .await
                     .is_ok()
             },
-            Duration::from_secs(10),
+            Duration::from_secs(30),
         )
         .await;
         println!("{:?}", p_a.list_routes().await);

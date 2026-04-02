@@ -1,14 +1,16 @@
 mod acl_manage;
-mod api;
 mod config;
 mod connector_manage;
+mod credential_manage;
 mod mapped_listener_manage;
+mod peer_center;
 mod peer_manage;
 mod port_forward_manage;
 mod proxy;
 mod stats;
 mod vpn_portal;
 
+pub mod api;
 pub mod instance_manage;
 pub mod logger;
 pub mod remote_client;
@@ -65,6 +67,19 @@ pub trait InstanceRpcService: Sync + Send {
     fn get_config_service(
         &self,
     ) -> &dyn crate::proto::api::config::ConfigRpc<
+        Controller = crate::proto::rpc_types::controller::BaseController,
+    >;
+    fn get_peer_center_service(
+        &self,
+    ) -> std::sync::Arc<
+        dyn crate::proto::peer_rpc::PeerCenterRpc<
+                Controller = crate::proto::rpc_types::controller::BaseController,
+            > + Send
+            + Sync,
+    >;
+    fn get_credential_manage_service(
+        &self,
+    ) -> &dyn crate::proto::api::instance::CredentialManageRpc<
         Controller = crate::proto::rpc_types::controller::BaseController,
     >;
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
@@ -32,8 +32,12 @@ use tokio::{
 
 use crate::{
     common::{
-        config::NetworkIdentity, constants::EASYTIER_VERSION, global_ctx::ArcGlobalCtx,
-        shrink_dashmap, stun::StunInfoCollectorTrait, PeerId,
+        config::NetworkIdentity,
+        constants::EASYTIER_VERSION,
+        global_ctx::{ArcGlobalCtx, GlobalCtxEvent},
+        shrink_dashmap,
+        stun::StunInfoCollectorTrait,
+        PeerId,
     },
     peers::route_trait::{Route, RouteInterfaceBox},
     proto::{
@@ -43,9 +47,10 @@ use crate::{
             route_foreign_network_infos, route_foreign_network_summary,
             sync_route_info_request::ConnInfo, ForeignNetworkRouteInfoEntry,
             ForeignNetworkRouteInfoKey, OspfRouteRpc, OspfRouteRpcClientFactory,
-            OspfRouteRpcServer, PeerGroupInfo, PeerIdVersion, RouteForeignNetworkInfos,
-            RouteForeignNetworkSummary, RoutePeerInfo, RoutePeerInfos, SyncRouteInfoError,
-            SyncRouteInfoRequest, SyncRouteInfoResponse,
+            OspfRouteRpcServer, PeerGroupInfo, PeerIdVersion, PeerIdentityType,
+            RouteForeignNetworkInfos, RouteForeignNetworkSummary, RoutePeerInfo, RoutePeerInfos,
+            SyncRouteInfoError, SyncRouteInfoRequest, SyncRouteInfoResponse,
+            TrustedCredentialPubkey,
         },
         rpc_types::{
             self,
@@ -65,6 +70,9 @@ use super::{
     PeerPacketFilter,
 };
 
+use atomic_shim::AtomicU64;
+use itertools::Itertools;
+
 static SERVICE_ID: u32 = 7;
 static UPDATE_PEER_INFO_PERIOD: Duration = Duration::from_secs(3600);
 static REMOVE_DEAD_PEER_INFO_AFTER: Duration = Duration::from_secs(3660);
@@ -79,6 +87,43 @@ static FORCE_USE_CONN_LIST: AtomicBool = AtomicBool::new(false);
 static REMOVE_UNREACHABLE_PEER_INFO_AFTER: Duration = Duration::from_secs(90);
 
 type Version = u32;
+
+/// Check if `child` CIDR is a subset of `parent` CIDR.
+/// Returns true if `child` is contained within `parent`, or if they are equal.
+fn cidr_is_subset(child: &IpCidr, parent: &IpCidr) -> bool {
+    match (child, parent) {
+        (IpCidr::V4(c), IpCidr::V4(p)) => {
+            p.first_address() <= c.first_address() && c.last_address() <= p.last_address()
+        }
+        (IpCidr::V6(c), IpCidr::V6(p)) => {
+            p.first_address() <= c.first_address() && c.last_address() <= p.last_address()
+        }
+        _ => false, // mixed v4/v6
+    }
+}
+
+/// Check if `child` CIDR is a subset of `parent` CIDR (both as string representations).
+fn cidr_is_subset_str(child: &str, parent: &str) -> bool {
+    let Ok(child_cidr) = child.parse::<IpCidr>() else {
+        return false;
+    };
+    let Ok(parent_cidr) = parent.parse::<IpCidr>() else {
+        return false;
+    };
+    cidr_is_subset(&child_cidr, &parent_cidr)
+}
+
+/// Patch specific fields in a raw DynamicMessage from a decoded RoutePeerInfo,
+/// preserving all other fields (including unknown ones).
+fn patch_raw_from_info(raw: &mut DynamicMessage, info: &RoutePeerInfo, fields: &[&str]) {
+    let mut decoded_raw = DynamicMessage::new(RoutePeerInfo::default().descriptor());
+    decoded_raw.transcode_from(info).unwrap();
+    for field_name in fields {
+        if let Some(value) = decoded_raw.get_field_by_name(field_name) {
+            raw.set_field_by_name(field_name, value.into_owned());
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct AtomicVersion(Arc<AtomicU32>);
@@ -146,6 +191,8 @@ impl RoutePeerInfo {
             groups: Vec::new(),
 
             quic_port: None,
+            noise_static_pubkey: Vec::new(),
+            trusted_credential_pubkeys: Vec::new(),
         }
     }
 
@@ -164,6 +211,12 @@ impl RoutePeerInfo {
         global_ctx: &ArcGlobalCtx,
     ) -> Self {
         let stun_info = global_ctx.get_stun_info_collector().get_stun_info();
+        let noise_static_pubkey = global_ctx
+            .config
+            .get_secure_mode()
+            .and_then(|cfg| cfg.public_key().ok())
+            .map(|pk| pk.as_bytes().to_vec())
+            .unwrap_or_default();
         Self {
             peer_id: my_peer_id,
             inst_id: Some(global_ctx.get_id().into()),
@@ -196,6 +249,19 @@ impl RoutePeerInfo {
             ipv6_addr: global_ctx.get_ipv6().map(|x| x.into()),
 
             groups: global_ctx.get_acl_groups(my_peer_id),
+
+            noise_static_pubkey,
+
+            // Only admin nodes (holding network_secret) publish trusted credential pubkeys
+            trusted_credential_pubkeys: if let Some(network_secret) =
+                global_ctx.get_network_identity().network_secret
+            {
+                global_ctx
+                    .get_credential_manager()
+                    .get_trusted_pubkeys(&network_secret)
+            } else {
+                Vec::new()
+            },
 
             ..Default::default()
         }
@@ -317,6 +383,13 @@ impl Default for RouteConnInfo {
     }
 }
 
+#[derive(Debug, Default)]
+struct InterfacePeerSnapshot {
+    generation: u64,
+    peers: BTreeSet<PeerId>,
+    identity_types: BTreeMap<PeerId, Option<PeerIdentityType>>,
+}
+
 // constructed with all infos synced from all peers.
 struct SyncedRouteInfo {
     peer_infos: RwLock<OrderedHashMap<PeerId, RoutePeerInfo>>,
@@ -326,6 +399,10 @@ struct SyncedRouteInfo {
     foreign_network: DashMap<ForeignNetworkRouteInfoKey, ForeignNetworkRouteInfoEntry>,
     group_trust_map: DashMap<PeerId, HashMap<String, Vec<u8>>>,
     group_trust_map_cache: DashMap<PeerId, Arc<Vec<String>>>, // cache for group trust map, should sync with group_trust_map
+
+    // Aggregated trusted credential pubkeys from all admin nodes
+    // Maps pubkey bytes -> TrustedCredentialPubkey
+    trusted_credential_pubkeys: DashMap<Vec<u8>, TrustedCredentialPubkey>,
 
     version: AtomicVersion,
 }
@@ -343,6 +420,19 @@ impl Debug for SyncedRouteInfo {
 }
 
 impl SyncedRouteInfo {
+    fn mark_credential_peer(info: &mut RoutePeerInfo, is_credential_peer: bool) {
+        let mut feature_flag = info.feature_flag.unwrap_or_default();
+        feature_flag.is_credential_peer = is_credential_peer;
+        info.feature_flag = Some(feature_flag);
+    }
+
+    fn is_credential_peer_info(info: &RoutePeerInfo) -> bool {
+        info.feature_flag
+            .as_ref()
+            .map(|x| x.is_credential_peer)
+            .unwrap_or(false)
+    }
+
     fn get_connected_peers<T: FromIterator<PeerId>>(&self, peer_id: PeerId) -> Option<T> {
         self.conn_map
             .read()
@@ -821,6 +911,171 @@ impl SyncedRouteInfo {
         self.group_trust_map_cache
             .insert(my_peer_id, Arc::new(my_group_names));
     }
+
+    /// Collect trusted credential pubkeys from admin nodes (network_secret holders)
+    /// and verify credential peers. Returns set of peer_ids that should be removed.
+    /// Also returns a HashMap of trusted keys for synchronization to GlobalCtx.
+    fn verify_and_update_credential_trusts(
+        &self,
+        network_secret: Option<&str>,
+    ) -> (
+        Vec<PeerId>,
+        HashMap<Vec<u8>, crate::common::global_ctx::TrustedKeyMetadata>,
+    ) {
+        use crate::common::global_ctx::{TrustedKeyMetadata, TrustedKeySource};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Step 1: Collect trusted credential pubkeys from admin nodes (take union)
+        // Only trust nodes whose secret_digest matches ours (i.e. they hold network_secret)
+        let mut all_trusted: HashMap<Vec<u8>, TrustedCredentialPubkey> = HashMap::new();
+        // Also collect all peer pubkeys for GlobalCtx synchronization
+        let mut global_trusted_keys: HashMap<Vec<u8>, TrustedKeyMetadata> = HashMap::new();
+
+        let peer_infos = self.peer_infos.read();
+
+        for (_, info) in peer_infos.iter() {
+            if !self.is_admin_peer(info) {
+                continue;
+            }
+            // Collect all peer noise_static_pubkeys as trusted keys
+            if !info.noise_static_pubkey.is_empty() {
+                global_trusted_keys.insert(
+                    info.noise_static_pubkey.clone(),
+                    TrustedKeyMetadata {
+                        source: TrustedKeySource::OspfNode,
+                        expiry_unix: None, // Peer pubkeys never expire
+                    },
+                );
+            }
+            for proof in &info.trusted_credential_pubkeys {
+                // If we have a network_secret, verify the HMAC as before.
+                // If we don't (e.g. credential nodes), accept proofs from admin peers
+                // based on the authenticated channel instead of local HMAC verification.
+                let hmac_valid = network_secret
+                    .map(|secret| proof.verify_credential_hmac(secret))
+                    .unwrap_or(true);
+                if !hmac_valid {
+                    continue;
+                }
+                let Some(tc) = proof.credential.as_ref() else {
+                    continue;
+                };
+                if tc.expiry_unix > now {
+                    all_trusted
+                        .entry(tc.pubkey.clone())
+                        .or_insert_with(|| tc.clone());
+                    // Also add to global trusted keys
+                    global_trusted_keys.insert(
+                        tc.pubkey.clone(),
+                        TrustedKeyMetadata {
+                            source: TrustedKeySource::OspfCredential,
+                            expiry_unix: Some(tc.expiry_unix),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Save the previous trusted set to detect revoked credentials
+        let prev_trusted: HashSet<Vec<u8>> = self
+            .trusted_credential_pubkeys
+            .iter()
+            .map(|r| r.key().clone())
+            .collect();
+
+        // Update the trusted_credential_pubkeys map
+        self.trusted_credential_pubkeys.clear();
+        for (k, v) in &all_trusted {
+            self.trusted_credential_pubkeys.insert(k.clone(), v.clone());
+        }
+
+        // Step 2: Update group trust map for credential peers
+        // Credential peers get their groups from the TrustedCredentialPubkey declaration
+        for (_, info) in peer_infos.iter() {
+            if info.noise_static_pubkey.is_empty() {
+                continue;
+            }
+            if let Some(tc) = all_trusted.get(&info.noise_static_pubkey) {
+                // This peer is a credential peer, assign groups from credential declaration
+                if !tc.groups.is_empty() {
+                    let mut group_map = HashMap::new();
+                    let mut group_names = Vec::new();
+                    for g in &tc.groups {
+                        group_map.insert(g.clone(), Vec::new()); // no proof needed, admin-declared
+                        group_names.push(g.clone());
+                    }
+                    self.group_trust_map.insert(info.peer_id, group_map);
+                    self.group_trust_map_cache
+                        .insert(info.peer_id, Arc::new(group_names));
+                }
+            }
+        }
+
+        // Step 3: Find and remove peers with revoked/expired credentials.
+        // A peer is untrusted if:
+        // - Its noise_static_pubkey was in the PREVIOUS trusted set (it was a credential peer)
+        // - Its noise_static_pubkey is NOT in the CURRENT trusted set (credential revoked/expired)
+        let mut untrusted_peers = Vec::new();
+        for (peer_id, info) in peer_infos.iter() {
+            if info.noise_static_pubkey.is_empty() || info.version == 0 {
+                continue;
+            }
+            // Only remove peers whose pubkey was previously trusted but no longer is
+            if prev_trusted.contains(&info.noise_static_pubkey)
+                && !all_trusted.contains_key(&info.noise_static_pubkey)
+            {
+                untrusted_peers.push(*peer_id);
+            }
+        }
+
+        // Remove untrusted peers from peer_infos so they won't appear in route graph
+        if !untrusted_peers.is_empty() {
+            drop(peer_infos); // release read lock before writing
+            let mut peer_infos_write = self.peer_infos.write();
+            for peer_id in &untrusted_peers {
+                tracing::warn!(?peer_id, "removing untrusted peer from route info");
+                peer_infos_write.remove(peer_id);
+                self.raw_peer_infos.remove(peer_id);
+            }
+            drop(peer_infos_write);
+            // Also remove from conn_map
+            let mut conn_map = self.conn_map.write();
+            for peer_id in &untrusted_peers {
+                conn_map.remove(peer_id);
+            }
+            self.version.inc();
+        }
+
+        (untrusted_peers, global_trusted_keys)
+    }
+
+    fn is_admin_peer(&self, info: &RoutePeerInfo) -> bool {
+        if info.version == 0 {
+            return false;
+        }
+        !Self::is_credential_peer_info(info)
+    }
+
+    fn is_credential_peer(&self, peer_id: PeerId) -> bool {
+        let peer_infos = self.peer_infos.read();
+        peer_infos
+            .get(&peer_id)
+            .map(Self::is_credential_peer_info)
+            .unwrap_or(false)
+    }
+
+    fn get_credential_info_by_pubkey(&self, peer_pubkey: &[u8]) -> Option<TrustedCredentialPubkey> {
+        if peer_pubkey.is_empty() {
+            return None;
+        }
+        self.trusted_credential_pubkeys
+            .get(peer_pubkey)
+            .map(|r| r.value().clone())
+    }
 }
 
 type PeerGraph = Graph<PeerId, usize, Directed>;
@@ -968,6 +1223,14 @@ impl RouteTable {
         start_node: &NodeIndex,
         version: Version,
     ) {
+        if graph.node_weight(*start_node).is_none() {
+            tracing::warn!(
+                ?start_node,
+                version,
+                "invalid start node for least-hop route rebuild"
+            );
+            return;
+        }
         let normalize_edge_cost = |e: petgraph::graph::EdgeReference<usize>| {
             if *e.weight() >= AVOID_RELAY_COST {
                 AVOID_RELAY_COST + 1
@@ -1011,6 +1274,14 @@ impl RouteTable {
         start_node: &NodeIndex,
         version: Version,
     ) {
+        if graph.node_weight(*start_node).is_none() {
+            tracing::warn!(
+                ?start_node,
+                version,
+                "invalid start node for least-cost route rebuild"
+            );
+            return;
+        }
         let (costs, next_hops) = dijkstra_with_first_hop(&graph, *start_node, |e| *e.weight());
 
         for (dst, (next_hop, path_len)) in next_hops.iter() {
@@ -1043,12 +1314,33 @@ impl RouteTable {
     ) {
         let version = synced_info.version.get();
 
+        let local_proxy_cidrs = synced_info
+            .peer_infos
+            .read()
+            .get(&my_peer_id)
+            .into_iter()
+            .flat_map(|info| &info.proxy_cidrs)
+            .filter_map(|cidr| cidr.parse::<IpCidr>().ok())
+            .collect_vec();
+
         // build next hop map
         let (graph, start_node) =
             Self::build_peer_graph_from_synced_info(my_peer_id, synced_info, cost_calc);
 
         if graph.node_count() == 0 {
             tracing::warn!("no peer in graph, cannot build next hop map");
+            self.next_hop_map_version.set_if_larger(version);
+            self.clean_expired_route_info();
+            return;
+        }
+        if start_node == NodeIndex::end() {
+            tracing::warn!(
+                ?my_peer_id,
+                version,
+                "my peer id is missing in graph, skip next-hop rebuild this round"
+            );
+            self.next_hop_map_version.set_if_larger(version);
+            self.clean_expired_route_info();
             return;
         }
 
@@ -1116,9 +1408,27 @@ impl RouteTable {
             }
 
             for cidr in info.proxy_cidrs.iter() {
-                let cidr = cidr.parse::<IpCidr>();
+                let Ok(cidr) = cidr.parse::<IpCidr>() else {
+                    tracing::warn!("invalid proxy cidr: {:?}, from peer: {:?}", cidr, peer_id);
+                    continue;
+                };
+
+                if *peer_id != my_peer_id
+                    && local_proxy_cidrs
+                        .iter()
+                        .any(|local_cidr| cidr_is_subset(&cidr, local_cidr))
+                {
+                    tracing::debug!(
+                        ?peer_id,
+                        ?my_peer_id,
+                        ?local_proxy_cidrs,
+                        ?cidr,
+                        "skip remote proxy cidr covered by local announced proxy cidr while building route table"
+                    );
+                    continue;
+                }
                 match cidr {
-                    Ok(IpCidr::V4(cidr)) => {
+                    IpCidr::V4(cidr) => {
                         new_cidr_prefix_trie
                             .entry(cidr)
                             .and_modify(|e| {
@@ -1130,7 +1440,7 @@ impl RouteTable {
                             .or_insert(peer_id_and_version);
                     }
 
-                    Ok(IpCidr::V6(cidr)) => {
+                    IpCidr::V6(cidr) => {
                         new_cidr_v6_prefix_trie
                             .entry(cidr)
                             .and_modify(|e| {
@@ -1140,10 +1450,6 @@ impl RouteTable {
                                 }
                             })
                             .or_insert(peer_id_and_version);
-                    }
-
-                    _ => {
-                        tracing::warn!("invalid proxy cidr: {:?}, from peer: {:?}", cidr, peer_id);
                     }
                 }
                 tracing::debug!(
@@ -1534,6 +1840,9 @@ struct PeerRouteServiceImpl {
     synced_route_info: SyncedRouteInfo,
     cached_local_conn_map: std::sync::Mutex<RouteConnBitmap>,
     cached_local_conn_map_version: AtomicVersion,
+    cached_interface_peer_snapshot: std::sync::Mutex<Arc<InterfacePeerSnapshot>>,
+    interface_peers_generation: AtomicU64,
+    applied_interface_peers_generation: AtomicU64,
 
     last_update_my_foreign_network: AtomicCell<Option<std::time::Instant>>,
 
@@ -1587,15 +1896,39 @@ impl PeerRouteServiceImpl {
                 foreign_network: DashMap::new(),
                 group_trust_map: DashMap::new(),
                 group_trust_map_cache: DashMap::new(),
+                trusted_credential_pubkeys: DashMap::new(),
                 version: AtomicVersion::new(),
             },
             cached_local_conn_map: std::sync::Mutex::new(RouteConnBitmap::default()),
             cached_local_conn_map_version: AtomicVersion::new(),
+            cached_interface_peer_snapshot: std::sync::Mutex::new(Arc::new(
+                InterfacePeerSnapshot::default(),
+            )),
+            interface_peers_generation: AtomicU64::new(1),
+            applied_interface_peers_generation: AtomicU64::new(0),
 
             last_update_my_foreign_network: AtomicCell::new(None),
 
             peer_info_last_update: AtomicCell::new(std::time::Instant::now()),
         }
+    }
+
+    fn get_my_secret_digest(&self) -> Option<Vec<u8>> {
+        let ni = self.global_ctx.get_network_identity();
+        ni.network_secret_digest.map(|d| d.to_vec())
+    }
+
+    fn is_credential_node(&self) -> bool {
+        self.global_ctx
+            .get_network_identity()
+            .network_secret
+            .is_none()
+            && self
+                .global_ctx
+                .config
+                .get_secure_mode()
+                .map(|c| c.enabled)
+                .unwrap_or(false)
     }
 
     fn get_or_create_session(&self, dst_peer_id: PeerId) -> Arc<SyncRouteSession> {
@@ -1619,40 +1952,126 @@ impl PeerRouteServiceImpl {
         self.sessions.iter().map(|x| *x.key()).collect()
     }
 
+    pub fn mark_interface_peers_dirty(&self) {
+        self.interface_peers_generation
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn interface_peer_snapshot_uncached(&self) -> InterfacePeerSnapshot {
+        let interface = self.interface.lock().await;
+        let interface = interface.as_ref().unwrap();
+
+        let peers: BTreeSet<_> = interface.list_peers().await.into_iter().collect();
+        let mut identity_types = BTreeMap::new();
+        for peer_id in peers.iter().copied() {
+            identity_types.insert(peer_id, interface.get_peer_identity_type(peer_id).await);
+        }
+
+        InterfacePeerSnapshot {
+            generation: 0,
+            peers,
+            identity_types,
+        }
+    }
+
+    async fn interface_peer_snapshot(&self) -> Arc<InterfacePeerSnapshot> {
+        loop {
+            let start_generation = self.interface_peers_generation.load(Ordering::Acquire);
+            {
+                let cached = self.cached_interface_peer_snapshot.lock().unwrap();
+                if cached.generation == start_generation {
+                    return cached.clone();
+                }
+            }
+
+            let mut snapshot = self.interface_peer_snapshot_uncached().await;
+            let end_generation = self.interface_peers_generation.load(Ordering::Acquire);
+            if start_generation == end_generation {
+                snapshot.generation = end_generation;
+                let snapshot = Arc::new(snapshot);
+                *self.cached_interface_peer_snapshot.lock().unwrap() = snapshot.clone();
+                return snapshot;
+            }
+        }
+    }
+
+    async fn list_peers_from_interface_snapshot(&self) -> (u64, BTreeSet<PeerId>) {
+        let snapshot = self.interface_peer_snapshot().await;
+        (snapshot.generation, snapshot.peers.clone())
+    }
+
     async fn list_peers_from_interface<T: FromIterator<PeerId>>(&self) -> T {
+        self.interface_peer_snapshot()
+            .await
+            .peers
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    async fn get_peer_identity_type_from_interface(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<PeerIdentityType> {
+        let snapshot = self.interface_peer_snapshot().await;
+        if let Some(identity_type) = snapshot.identity_types.get(&peer_id) {
+            return *identity_type;
+        }
+
         self.interface
             .lock()
             .await
             .as_ref()
             .unwrap()
-            .list_peers()
+            .get_peer_identity_type(peer_id)
             .await
-            .into_iter()
-            .collect()
+    }
+
+    async fn get_peer_public_key_from_interface(&self, peer_id: PeerId) -> Option<Vec<u8>> {
+        self.interface
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .get_peer_public_key(peer_id)
+            .await
     }
 
     fn update_my_peer_info(&self) -> bool {
-        if self.synced_route_info.update_my_peer_info(
+        self.synced_route_info.update_my_peer_info(
             self.my_peer_id,
             self.my_peer_route_id,
             &self.global_ctx,
-        ) {
-            self.update_route_table_and_cached_local_conn_bitmap();
-            return true;
-        }
-        false
+        )
     }
 
     async fn update_my_conn_info(&self) -> bool {
-        let connected_peers: BTreeSet<PeerId> = self.list_peers_from_interface().await;
+        let current_generation = self.interface_peers_generation.load(Ordering::Acquire);
+        let generation_applied = self
+            .applied_interface_peers_generation
+            .load(Ordering::Acquire)
+            == current_generation;
+        if generation_applied {
+            let need_periodic_requery = self
+                .interface
+                .lock()
+                .await
+                .as_ref()
+                .map(|x| x.need_periodic_requery_peers())
+                .unwrap_or(false);
+            if !need_periodic_requery {
+                return false;
+            }
+
+            self.mark_interface_peers_dirty();
+        }
+
+        let (generation, connected_peers) = self.list_peers_from_interface_snapshot().await;
         let updated = self
             .synced_route_info
             .update_my_conn_info(self.my_peer_id, connected_peers);
-
-        if updated {
-            self.update_route_table_and_cached_local_conn_bitmap();
-        }
-
+        self.applied_interface_peers_generation
+            .store(generation, Ordering::Release);
         updated
     }
 
@@ -1761,6 +2180,18 @@ impl PeerRouteServiceImpl {
             .unwrap_or(false)
     }
 
+    fn handle_global_ctx_event(&self, event: &GlobalCtxEvent) {
+        if matches!(
+            event,
+            GlobalCtxEvent::PeerAdded(_)
+                | GlobalCtxEvent::PeerRemoved(_)
+                | GlobalCtxEvent::PeerConnAdded(_)
+                | GlobalCtxEvent::PeerConnRemoved(_)
+        ) {
+            self.mark_interface_peers_dirty();
+        }
+    }
+
     fn update_route_table_and_cached_local_conn_bitmap(&self) {
         self.update_peer_info_last_update();
 
@@ -1842,15 +2273,6 @@ impl PeerRouteServiceImpl {
             if let Some(last_update) = peer_info.last_update {
                 let last_update = TryInto::<SystemTime>::try_into(last_update).unwrap();
                 if last_sync_succ_timestamp.is_some_and(|t| last_update < t) {
-                    tracing::debug!(
-                        "ignore peer_info {:?} because last_update: {:?} is older than last_sync_succ_timestamp: {:?}, peer_infos_count: {}, my_peer_id: {:?}, session: {:?}",
-                        peer_info,
-                        last_update,
-                        last_sync_succ_timestamp,
-                        peer_infos.len(),
-                        self.my_peer_id,
-                        session
-                    );
                     break;
                 }
             }
@@ -1921,15 +2343,6 @@ impl PeerRouteServiceImpl {
             // stop iter if last_update of conn info is older than session.last_sync_succ_timestamp
             let last_update = TryInto::<SystemTime>::try_into(conn_info.last_update).unwrap();
             if last_sync_succ_timestamp.is_some_and(|t| last_update < t) {
-                tracing::debug!(
-                        "ignore conn info {:?} because last_update: {:?} is older than last_sync_succ_timestamp: {:?}, conn_map count: {}, my_peer_id: {:?}, session: {:?}",
-                        conn_info,
-                        last_update,
-                        last_sync_succ_timestamp,
-                        conn_map.len(),
-                        self.my_peer_id,
-                        session
-                    );
                 break;
             }
 
@@ -2012,13 +2425,47 @@ impl PeerRouteServiceImpl {
         let my_peer_info_updated = self.update_my_peer_info();
         let my_conn_info_updated = self.update_my_conn_info().await;
         let my_foreign_network_updated = self.update_my_foreign_network().await;
-        if my_conn_info_updated || my_peer_info_updated {
+        let mut untrusted_changed = false;
+        if my_peer_info_updated {
+            untrusted_changed = self.refresh_credential_trusts_and_disconnect().await;
+        }
+
+        if my_peer_info_updated || my_conn_info_updated || untrusted_changed {
+            self.update_route_table_and_cached_local_conn_bitmap();
             self.update_foreign_network_owner_map();
         }
         if my_peer_info_updated {
             self.update_peer_info_last_update();
         }
         my_peer_info_updated || my_conn_info_updated || my_foreign_network_updated
+    }
+
+    async fn refresh_credential_trusts_and_disconnect(&self) -> bool {
+        let network_identity = self.global_ctx.get_network_identity();
+        let network_secret = network_identity.network_secret.as_deref();
+        let (untrusted, global_trusted_keys) = self
+            .synced_route_info
+            .verify_and_update_credential_trusts(network_secret);
+        self.global_ctx
+            .update_trusted_keys(global_trusted_keys, &network_identity.network_name);
+        self.disconnect_untrusted_peers(&untrusted).await;
+        !untrusted.is_empty()
+    }
+
+    async fn disconnect_untrusted_peers(&self, untrusted_peers: &[PeerId]) {
+        if untrusted_peers.is_empty() {
+            return;
+        }
+
+        let interface = self.interface.lock().await;
+        let Some(interface) = interface.as_ref() else {
+            return;
+        };
+
+        for peer_id in untrusted_peers {
+            tracing::warn!(?peer_id, "disconnecting untrusted peer");
+            interface.close_peer(*peer_id).await;
+        }
     }
 
     fn build_sync_request(
@@ -2065,7 +2512,7 @@ impl PeerRouteServiceImpl {
         }
     }
 
-    fn clear_expired_peer(&self) {
+    async fn clear_expired_peer(&self) {
         let now = SystemTime::now();
         let mut to_remove = Vec::new();
         for (peer_id, peer_info) in self.synced_route_info.peer_infos.read().iter() {
@@ -2105,6 +2552,7 @@ impl PeerRouteServiceImpl {
             self.synced_route_info.foreign_network.remove(p);
         }
 
+        self.refresh_credential_trusts_and_disconnect().await;
         self.route_table.clean_expired_route_info();
         self.route_table_with_cost.clean_expired_route_info();
     }
@@ -2168,7 +2616,7 @@ impl PeerRouteServiceImpl {
             return true;
         }
 
-        tracing::debug!(?foreign_network, "sync_route request need send to peer. my_id {:?}, pper_id: {:?}, peer_infos: {:?}, conn_info: {:?}, synced_route_info: {:?} session: {:?}",
+        tracing::debug!(?foreign_network, "sync_route request need send to peer. my_id {:?}, dst_peer_id: {:?}, peer_infos: {:?}, conn_info: {:?}, synced_route_info: {:?} session: {:?}",
                        my_peer_id, dst_peer_id, peer_infos, conn_info, self.synced_route_info, session);
 
         session
@@ -2490,10 +2938,9 @@ impl RouteSessionManager {
                 _ = recv.recv() => {}
             }
 
-            let mut peers = service_impl.list_peers_from_interface::<Vec<_>>().await;
-            peers.sort();
-
-            let session_peers = self.list_session_peers();
+            let interface_snapshot = service_impl.interface_peer_snapshot().await;
+            let peers = &interface_snapshot.peers;
+            let session_peers = self.list_session_peer_set();
             for peer_id in session_peers.iter() {
                 if !peers.contains(peer_id) {
                     if Some(*peer_id) == cur_dst_peer_id_to_initiate {
@@ -2504,16 +2951,30 @@ impl RouteSessionManager {
             }
 
             // find peer_ids that are not initiators.
-            let initiator_candidates = peers
-                .iter()
-                .filter(|x| {
-                    let Some(session) = service_impl.get_session(**x) else {
-                        return true;
-                    };
-                    !session.dst_is_initiator.load(Ordering::Relaxed)
-                })
-                .copied()
-                .collect::<Vec<_>>();
+            let mut initiator_candidates = Vec::new();
+            for peer_id in peers.iter().copied() {
+                // Step 9a: Filter OSPF session candidates based on direct auth level.
+                // - Credential nodes only initiate sessions to admin nodes (not other credential nodes)
+                // - Admin nodes don't initiate sessions to credential nodes
+                let identity_type = interface_snapshot
+                    .identity_types
+                    .get(&peer_id)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(PeerIdentityType::Admin);
+                if matches!(identity_type, PeerIdentityType::Credential) {
+                    continue;
+                }
+
+                let Some(session) = service_impl.get_session(peer_id) else {
+                    initiator_candidates.push(peer_id);
+                    continue;
+                };
+
+                if !session.dst_is_initiator.load(Ordering::Relaxed) {
+                    initiator_candidates.push(peer_id);
+                }
+            }
 
             if initiator_candidates.is_empty() {
                 next_sleep_ms = 1000;
@@ -2556,6 +3017,7 @@ impl RouteSessionManager {
                     continue;
                 };
                 session.update_initiator_flag(true);
+                self.sync_now("update_initiator_flag");
             }
 
             // clear sessions that are neither dst_initiator or we_are_initiator.
@@ -2584,6 +3046,14 @@ impl RouteSessionManager {
         service_impl.list_session_peers()
     }
 
+    fn list_session_peer_set(&self) -> BTreeSet<PeerId> {
+        let Some(service_impl) = self.service_impl.upgrade() else {
+            return BTreeSet::new();
+        };
+
+        service_impl.list_session_peers().into_iter().collect()
+    }
+
     fn dump_sessions(&self) -> Result<String, Error> {
         let Some(service_impl) = self.service_impl.upgrade() else {
             return Err(Error::Stopped);
@@ -2607,6 +3077,33 @@ impl RouteSessionManager {
         tracing::debug!(?ret, ?reason, "sync_now_broadcast.send");
     }
 
+    fn extract_credential_peer_info(
+        &self,
+        from_peer_id: PeerId,
+        peer_infos: &[RoutePeerInfo],
+        raw_peer_infos: &[DynamicMessage],
+        credential: &TrustedCredentialPubkey,
+    ) -> Option<(RoutePeerInfo, DynamicMessage)> {
+        let info_idx = peer_infos.iter().position(|p| p.peer_id == from_peer_id)?;
+        let mut info = peer_infos[info_idx].clone();
+        let mut raw_info = raw_peer_infos[info_idx].clone();
+        let allowed_cidrs = &credential.allowed_proxy_cidrs;
+        // Filter proxy_cidrs to only those allowed by credential
+        if !allowed_cidrs.is_empty() {
+            info.proxy_cidrs.retain(|cidr| {
+                allowed_cidrs
+                    .iter()
+                    .any(|allowed| cidr_is_subset_str(cidr, allowed))
+            });
+        } else {
+            // No allowed_proxy_cidrs → no proxy_cidrs allowed
+            info.proxy_cidrs.clear();
+        }
+        SyncedRouteInfo::mark_credential_peer(&mut info, true);
+        patch_raw_from_info(&mut raw_info, &info, &["proxy_cidrs", "feature_flag"]);
+        Some((info, raw_info))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn do_sync_route_info(
         &self,
@@ -2625,6 +3122,28 @@ impl RouteSessionManager {
         let my_peer_id = service_impl.my_peer_id;
         let session = self.get_or_start_session(from_peer_id)?;
 
+        let from_identity_type = service_impl
+            .get_peer_identity_type_from_interface(from_peer_id)
+            .await
+            .unwrap_or(PeerIdentityType::Admin);
+        let from_is_credential = matches!(from_identity_type, PeerIdentityType::Credential);
+        let credential_info = if from_is_credential {
+            service_impl
+                .get_peer_public_key_from_interface(from_peer_id)
+                .await
+                .and_then(|pubkey| {
+                    service_impl
+                        .synced_route_info
+                        .get_credential_info_by_pubkey(&pubkey)
+                })
+        } else {
+            None
+        };
+        if from_is_credential && credential_info.is_none() {
+            // no credential found
+            return Err(Error::Stopped);
+        }
+
         let _session_lock = session.lock.lock();
 
         session.rpc_rx_count.fetch_add(1, Ordering::Relaxed);
@@ -2632,40 +3151,77 @@ impl RouteSessionManager {
         session.update_dst_session_id(from_session_id);
 
         let mut need_update_route_table = false;
+        let mut untrusted_peers = Vec::new();
 
         if let Some(peer_infos) = &peer_infos {
-            service_impl.synced_route_info.update_peer_infos(
-                my_peer_id,
-                service_impl.my_peer_route_id,
-                from_peer_id,
-                peer_infos,
-                raw_peer_infos.as_ref().unwrap(),
-            )?;
-            service_impl
-                .synced_route_info
-                .verify_and_update_group_trusts(
+            // Step 9b: credential peers can only propagate their own route info
+            // patch_raw_from_info(&mut raw, info, &["proxy_cidrs", "feature_flag"]);
+            let (pi, rpi) = if from_is_credential {
+                if let Some(ret) = self.extract_credential_peer_info(
+                    from_peer_id,
                     peer_infos,
-                    &service_impl.global_ctx.get_acl_group_declarations(),
-                );
-            session.update_dst_saved_peer_info_version(peer_infos, from_peer_id);
-            need_update_route_table = true;
+                    raw_peer_infos.as_deref().unwrap(),
+                    credential_info.as_ref().unwrap(),
+                ) {
+                    (&vec![ret.0], &vec![ret.1])
+                } else {
+                    (&vec![], &vec![])
+                }
+            } else {
+                (peer_infos, raw_peer_infos.as_ref().unwrap())
+            };
+            if !pi.is_empty() {
+                service_impl.synced_route_info.update_peer_infos(
+                    my_peer_id,
+                    service_impl.my_peer_route_id,
+                    from_peer_id,
+                    pi,
+                    rpi,
+                )?;
+                service_impl
+                    .synced_route_info
+                    .verify_and_update_group_trusts(
+                        pi,
+                        &service_impl.global_ctx.get_acl_group_declarations(),
+                    );
+                session.update_dst_saved_peer_info_version(pi, from_peer_id);
+                need_update_route_table = true;
+            }
         }
 
+        // Step 9b: credential peers' conn_info depends on allow_relay flag
         if let Some(conn_info) = &conn_info {
-            service_impl.synced_route_info.update_conn_info(conn_info);
-            session.update_dst_saved_conn_info_version(conn_info, from_peer_id);
-            need_update_route_table = true;
+            let accept_conn_info =
+                !from_is_credential || credential_info.map(|tc| tc.allow_relay).unwrap_or(false);
+            if accept_conn_info {
+                service_impl.synced_route_info.update_conn_info(conn_info);
+                session.update_dst_saved_conn_info_version(conn_info, from_peer_id);
+                need_update_route_table = true;
+            }
         }
 
         if need_update_route_table {
+            // Run credential verification and update route table
+            let network_identity = service_impl.global_ctx.get_network_identity();
+            let (untrusted, global_trusted_keys) = service_impl
+                .synced_route_info
+                .verify_and_update_credential_trusts(network_identity.network_secret.as_deref());
+            untrusted_peers = untrusted;
+            // Sync trusted keys to GlobalCtx for handshake verification
+            service_impl
+                .global_ctx
+                .update_trusted_keys(global_trusted_keys, &network_identity.network_name);
             service_impl.update_route_table_and_cached_local_conn_bitmap();
         }
 
         if let Some(foreign_network) = &foreign_network {
-            service_impl
-                .synced_route_info
-                .update_foreign_network(foreign_network);
-            session.update_dst_saved_foreign_network_version(foreign_network, from_peer_id);
+            // Step 9b: credential peers' foreign_network_infos are always ignored
+            if !from_is_credential {
+                service_impl
+                    .synced_route_info
+                    .update_foreign_network(foreign_network);
+                session.update_dst_saved_foreign_network_version(foreign_network, from_peer_id);
+            }
         }
 
         if need_update_route_table || foreign_network.is_some() {
@@ -2681,6 +3237,11 @@ impl RouteSessionManager {
             .store(is_initiator, Ordering::Relaxed);
         let is_initiator = session.we_are_initiator.load(Ordering::Relaxed);
         let session_id = session.my_session_id.load(Ordering::Relaxed);
+
+        drop(_session_lock);
+        service_impl
+            .disconnect_untrusted_peers(&untrusted_peers)
+            .await;
 
         self.sync_now("sync_route_info");
 
@@ -2737,7 +3298,7 @@ impl PeerRoute {
     async fn clear_expired_peer(service_impl: Arc<PeerRouteServiceImpl>) {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
-            service_impl.clear_expired_peer();
+            service_impl.clear_expired_peer().await;
             // TODO: use debug log level for this.
             tracing::debug!(?service_impl, "clear_expired_peer");
         }
@@ -2755,6 +3316,7 @@ impl PeerRoute {
         session_mgr: RouteSessionManager,
     ) {
         let mut global_event_receiver = service_impl.global_ctx.subscribe();
+        service_impl.mark_interface_peers_dirty();
         loop {
             if service_impl.update_my_infos().await {
                 session_mgr.sync_now("update_my_infos");
@@ -2768,6 +3330,12 @@ impl PeerRoute {
 
             select! {
                 ev = global_event_receiver.recv() => {
+                    if let Ok(ev_ref) = &ev {
+                        service_impl.handle_global_ctx_event(ev_ref);
+                    } else {
+                        service_impl.mark_interface_peers_dirty();
+                        global_event_receiver = global_event_receiver.resubscribe();
+                    }
                     tracing::info!(?ev, "global event received in update_my_peer_info_routine");
                 }
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -3022,36 +3590,238 @@ impl PeerPacketFilter for Arc<PeerRoute> {}
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeSet,
-        sync::{atomic::Ordering, Arc},
-        time::Duration,
-    };
-
     use cidr::{Ipv4Cidr, Ipv4Inet, Ipv6Inet};
     use dashmap::DashMap;
+    use parking_lot::Mutex;
     use prefix_trie::PrefixMap;
     use prost_reflect::{DynamicMessage, ReflectMessage};
+    use std::net::IpAddr;
+    use std::{
+        collections::{BTreeSet, HashMap},
+        sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        },
+        time::{Duration, SystemTime},
+    };
 
+    use super::{PeerRoute, REMOVE_DEAD_PEER_INFO_AFTER};
     use crate::{
-        common::{global_ctx::tests::get_mock_global_ctx, PeerId},
+        common::{
+            global_ctx::{tests::get_mock_global_ctx, GlobalCtxEvent, TrustedKeySource},
+            PeerId,
+        },
         connector::udp_hole_punch::tests::replace_stun_info_collector,
         peers::{
             create_packet_recv_chan,
             peer_manager::{PeerManager, RouteAlgoType},
             peer_ospf_route::{PeerIdVersion, PeerRouteServiceImpl, FORCE_USE_CONN_LIST},
-            route_trait::{NextHopPolicy, Route, RouteCostCalculatorInterface},
+            route_trait::{NextHopPolicy, Route, RouteCostCalculatorInterface, RouteInterface},
             tests::{connect_peer_manager, create_mock_peer_manager, wait_route_appear},
         },
         proto::{
-            common::NatType,
-            peer_rpc::{RoutePeerInfo, RoutePeerInfos, SyncRouteInfoRequest},
+            common::{NatType, PeerFeatureFlag},
+            peer_rpc::{
+                PeerIdentityType, RoutePeerInfo, RoutePeerInfos, SyncRouteInfoRequest,
+                TrustedCredentialPubkey, TrustedCredentialPubkeyProof,
+            },
         },
         tunnel::common::tests::wait_for_condition,
     };
     use prost::Message;
 
-    use super::PeerRoute;
+    struct AuthOnlyInterface {
+        my_peer_id: PeerId,
+        identity_type: DashMap<PeerId, PeerIdentityType>,
+        peer_public_key: DashMap<PeerId, Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RouteInterface for AuthOnlyInterface {
+        async fn list_peers(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+
+        fn my_peer_id(&self) -> PeerId {
+            self.my_peer_id
+        }
+
+        async fn get_peer_public_key(&self, peer_id: PeerId) -> Option<Vec<u8>> {
+            self.peer_public_key
+                .get(&peer_id)
+                .map(|x| x.value().clone())
+        }
+
+        async fn get_peer_identity_type(&self, peer_id: PeerId) -> Option<PeerIdentityType> {
+            self.identity_type.get(&peer_id).map(|x| *x.value())
+        }
+    }
+
+    struct TrackingInterface {
+        my_peer_id: PeerId,
+        closed_peers: Arc<Mutex<Vec<PeerId>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RouteInterface for TrackingInterface {
+        async fn list_peers(&self) -> Vec<PeerId> {
+            Vec::new()
+        }
+
+        fn my_peer_id(&self) -> PeerId {
+            self.my_peer_id
+        }
+
+        async fn close_peer(&self, peer_id: PeerId) {
+            self.closed_peers.lock().push(peer_id);
+        }
+    }
+
+    struct CountingInterface {
+        my_peer_id: PeerId,
+        peers: Arc<Mutex<Vec<PeerId>>>,
+        peer_identity_types: Arc<Mutex<HashMap<PeerId, Option<PeerIdentityType>>>>,
+        list_peers_calls: Arc<AtomicU32>,
+        get_peer_identity_type_calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl RouteInterface for CountingInterface {
+        async fn list_peers(&self) -> Vec<PeerId> {
+            self.list_peers_calls.fetch_add(1, Ordering::Relaxed);
+            self.peers.lock().clone()
+        }
+
+        async fn get_peer_identity_type(&self, peer_id: PeerId) -> Option<PeerIdentityType> {
+            self.get_peer_identity_type_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.peer_identity_types
+                .lock()
+                .get(&peer_id)
+                .copied()
+                .flatten()
+        }
+
+        fn my_peer_id(&self) -> PeerId {
+            self.my_peer_id
+        }
+    }
+
+    #[tokio::test]
+    async fn interface_peer_cache_refreshes_only_when_marked_dirty() {
+        let service_impl = PeerRouteServiceImpl::new(1, get_mock_global_ctx());
+        let peers = Arc::new(Mutex::new(vec![2, 3]));
+        let peer_identity_types = Arc::new(Mutex::new(HashMap::new()));
+        let list_peers_calls = Arc::new(AtomicU32::new(0));
+        let get_peer_identity_type_calls = Arc::new(AtomicU32::new(0));
+        *service_impl.interface.lock().await = Some(Box::new(CountingInterface {
+            my_peer_id: 1,
+            peers: peers.clone(),
+            peer_identity_types,
+            list_peers_calls: list_peers_calls.clone(),
+            get_peer_identity_type_calls,
+        }));
+
+        let first: BTreeSet<_> = service_impl.list_peers_from_interface().await;
+        let second: BTreeSet<_> = service_impl.list_peers_from_interface().await;
+
+        assert_eq!(first, BTreeSet::from([2, 3]));
+        assert_eq!(second, BTreeSet::from([2, 3]));
+        assert_eq!(list_peers_calls.load(Ordering::Relaxed), 1);
+
+        *peers.lock() = vec![2, 4];
+        service_impl.handle_global_ctx_event(&GlobalCtxEvent::PeerConnAdded(Default::default()));
+
+        let third: BTreeSet<_> = service_impl.list_peers_from_interface().await;
+        assert_eq!(third, BTreeSet::from([2, 4]));
+        assert_eq!(list_peers_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn update_my_conn_info_skips_interface_scan_when_topology_is_unchanged() {
+        let service_impl = PeerRouteServiceImpl::new(1, get_mock_global_ctx());
+        let peers = Arc::new(Mutex::new(vec![2, 3]));
+        let peer_identity_types = Arc::new(Mutex::new(HashMap::new()));
+        let list_peers_calls = Arc::new(AtomicU32::new(0));
+        let get_peer_identity_type_calls = Arc::new(AtomicU32::new(0));
+        *service_impl.interface.lock().await = Some(Box::new(CountingInterface {
+            my_peer_id: 1,
+            peers: peers.clone(),
+            peer_identity_types,
+            list_peers_calls: list_peers_calls.clone(),
+            get_peer_identity_type_calls: get_peer_identity_type_calls.clone(),
+        }));
+
+        assert!(service_impl.update_my_conn_info().await);
+        assert_eq!(list_peers_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(get_peer_identity_type_calls.load(Ordering::Relaxed), 2);
+
+        assert!(!service_impl.update_my_conn_info().await);
+        assert_eq!(list_peers_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(get_peer_identity_type_calls.load(Ordering::Relaxed), 2);
+
+        *peers.lock() = vec![2, 4];
+        service_impl.handle_global_ctx_event(&GlobalCtxEvent::PeerConnRemoved(Default::default()));
+
+        assert!(service_impl.update_my_conn_info().await);
+        assert_eq!(list_peers_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(get_peer_identity_type_calls.load(Ordering::Relaxed), 4);
+
+        assert!(!service_impl.update_my_conn_info().await);
+        assert_eq!(list_peers_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(get_peer_identity_type_calls.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn get_peer_identity_type_reuses_snapshot_until_topology_changes() {
+        let service_impl = PeerRouteServiceImpl::new(1, get_mock_global_ctx());
+        let peers = Arc::new(Mutex::new(vec![2, 3]));
+        let peer_identity_types = Arc::new(Mutex::new(HashMap::from([
+            (2, Some(PeerIdentityType::Credential)),
+            (3, Some(PeerIdentityType::Admin)),
+            (4, Some(PeerIdentityType::Admin)),
+        ])));
+        let list_peers_calls = Arc::new(AtomicU32::new(0));
+        let get_peer_identity_type_calls = Arc::new(AtomicU32::new(0));
+        *service_impl.interface.lock().await = Some(Box::new(CountingInterface {
+            my_peer_id: 1,
+            peers: peers.clone(),
+            peer_identity_types: peer_identity_types.clone(),
+            list_peers_calls: list_peers_calls.clone(),
+            get_peer_identity_type_calls: get_peer_identity_type_calls.clone(),
+        }));
+
+        assert_eq!(
+            service_impl.get_peer_identity_type_from_interface(2).await,
+            Some(PeerIdentityType::Credential)
+        );
+        assert_eq!(list_peers_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(get_peer_identity_type_calls.load(Ordering::Relaxed), 2);
+
+        assert_eq!(
+            service_impl.get_peer_identity_type_from_interface(2).await,
+            Some(PeerIdentityType::Credential)
+        );
+        assert_eq!(list_peers_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(get_peer_identity_type_calls.load(Ordering::Relaxed), 2);
+
+        *peers.lock() = vec![2, 4];
+        service_impl.handle_global_ctx_event(&GlobalCtxEvent::PeerConnRemoved(Default::default()));
+
+        assert_eq!(
+            service_impl.get_peer_identity_type_from_interface(4).await,
+            Some(PeerIdentityType::Admin)
+        );
+        assert_eq!(list_peers_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(get_peer_identity_type_calls.load(Ordering::Relaxed), 4);
+
+        assert_eq!(
+            service_impl.get_peer_identity_type_from_interface(4).await,
+            Some(PeerIdentityType::Admin)
+        );
+        assert_eq!(list_peers_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(get_peer_identity_type_calls.load(Ordering::Relaxed), 4);
+    }
 
     async fn create_mock_route(peer_mgr: Arc<PeerManager>) -> Arc<PeerRoute> {
         let peer_route = PeerRoute::new(
@@ -3095,6 +3865,321 @@ mod tests {
         let (tx1, rx1) = get_rpc_counter(route, peer_id);
         assert!(tx1 <= max_tx);
         assert!(rx1 <= max_rx);
+    }
+
+    #[tokio::test]
+    async fn credential_flag_controls_role_classification() {
+        let service_impl = PeerRouteServiceImpl::new(1, get_mock_global_ctx());
+
+        let mut admin_info = RoutePeerInfo::new();
+        admin_info.peer_id = 10;
+        admin_info.version = 1;
+        admin_info.feature_flag = Some(PeerFeatureFlag {
+            is_credential_peer: false,
+            ..Default::default()
+        });
+
+        let mut credential_info = RoutePeerInfo::new();
+        credential_info.peer_id = 11;
+        credential_info.version = 1;
+        credential_info.feature_flag = Some(PeerFeatureFlag {
+            is_credential_peer: true,
+            ..Default::default()
+        });
+
+        {
+            let mut guard = service_impl.synced_route_info.peer_infos.write();
+            guard.insert(admin_info.peer_id, admin_info.clone());
+            guard.insert(credential_info.peer_id, credential_info.clone());
+        }
+
+        assert!(service_impl.synced_route_info.is_admin_peer(&admin_info));
+        assert!(!service_impl
+            .synced_route_info
+            .is_admin_peer(&credential_info));
+        assert!(service_impl
+            .synced_route_info
+            .is_credential_peer(credential_info.peer_id));
+        assert!(!service_impl
+            .synced_route_info
+            .is_credential_peer(admin_info.peer_id));
+    }
+
+    #[tokio::test]
+    async fn trusted_credentials_only_from_admin_publishers() {
+        let service_impl = PeerRouteServiceImpl::new(1, get_mock_global_ctx());
+        let network_secret = "sec1";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let admin_key = vec![1; 32];
+        let credential_key = vec![2; 32];
+
+        let mut admin_info = RoutePeerInfo::new();
+        admin_info.peer_id = 20;
+        admin_info.version = 1;
+        admin_info.feature_flag = Some(PeerFeatureFlag {
+            is_credential_peer: false,
+            ..Default::default()
+        });
+        admin_info.trusted_credential_pubkeys = vec![TrustedCredentialPubkeyProof::new_signed(
+            TrustedCredentialPubkey {
+                pubkey: admin_key.clone(),
+                expiry_unix: now + 600,
+                ..Default::default()
+            },
+            network_secret,
+        )];
+
+        let mut credential_info = RoutePeerInfo::new();
+        credential_info.peer_id = 21;
+        credential_info.version = 1;
+        credential_info.feature_flag = Some(PeerFeatureFlag {
+            is_credential_peer: true,
+            ..Default::default()
+        });
+        credential_info.trusted_credential_pubkeys =
+            vec![TrustedCredentialPubkeyProof::new_signed(
+                TrustedCredentialPubkey {
+                    pubkey: credential_key.clone(),
+                    expiry_unix: now + 600,
+                    ..Default::default()
+                },
+                network_secret,
+            )];
+
+        {
+            let mut guard = service_impl.synced_route_info.peer_infos.write();
+            guard.insert(admin_info.peer_id, admin_info);
+            guard.insert(credential_info.peer_id, credential_info);
+        }
+
+        service_impl
+            .synced_route_info
+            .verify_and_update_credential_trusts(Some(network_secret));
+
+        assert!(service_impl
+            .synced_route_info
+            .trusted_credential_pubkeys
+            .contains_key(&admin_key));
+        assert!(!service_impl
+            .synced_route_info
+            .trusted_credential_pubkeys
+            .contains_key(&credential_key));
+    }
+
+    #[tokio::test]
+    async fn sync_route_info_marks_credential_sender_and_filters_entries() {
+        let peer_mgr = create_mock_pmgr().await;
+        let route = create_mock_route(peer_mgr.clone()).await;
+        let from_peer_id: PeerId = 10001;
+        let forwarded_peer_id: PeerId = 10002;
+        let credential_pubkey = vec![3u8; 32];
+
+        let identity_type = DashMap::new();
+        identity_type.insert(from_peer_id, PeerIdentityType::Credential);
+        let peer_public_key = DashMap::new();
+        peer_public_key.insert(from_peer_id, credential_pubkey.clone());
+        *route.service_impl.interface.lock().await = Some(Box::new(AuthOnlyInterface {
+            my_peer_id: peer_mgr.my_peer_id(),
+            identity_type,
+            peer_public_key,
+        }));
+        route
+            .service_impl
+            .synced_route_info
+            .trusted_credential_pubkeys
+            .insert(
+                credential_pubkey.clone(),
+                TrustedCredentialPubkey {
+                    pubkey: credential_pubkey,
+                    expiry_unix: i64::MAX,
+                    ..Default::default()
+                },
+            );
+
+        let mut sender_info = RoutePeerInfo::new();
+        sender_info.peer_id = from_peer_id;
+        sender_info.version = 1;
+        sender_info.proxy_cidrs = vec!["10.10.0.0/24".to_string()];
+
+        let mut forwarded_info = RoutePeerInfo::new();
+        forwarded_info.peer_id = forwarded_peer_id;
+        forwarded_info.version = 1;
+
+        let make_raw = |info: &RoutePeerInfo| {
+            let mut raw = DynamicMessage::new(RoutePeerInfo::default().descriptor());
+            raw.transcode_from(info).unwrap();
+            raw
+        };
+        let raw_infos = vec![make_raw(&sender_info), make_raw(&forwarded_info)];
+
+        route
+            .session_mgr
+            .do_sync_route_info(
+                from_peer_id,
+                1,
+                true,
+                Some(vec![sender_info, forwarded_info]),
+                Some(raw_infos),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let guard = route.service_impl.synced_route_info.peer_infos.read();
+        let stored = guard.get(&from_peer_id).unwrap();
+        assert!(stored
+            .feature_flag
+            .as_ref()
+            .map(|x| x.is_credential_peer)
+            .unwrap_or(false));
+        assert!(stored.proxy_cidrs.is_empty());
+        assert!(guard.get(&forwarded_peer_id).is_none());
+    }
+
+    // shared node doesn't have hmac.
+    #[tokio::test]
+    async fn sync_route_info_shared_sender_cannot_publish_trusted_credentials() {
+        let peer_mgr = create_mock_pmgr().await;
+        let route = create_mock_route(peer_mgr.clone()).await;
+        let from_peer_id: PeerId = 10021;
+        let forwarded_peer_id: PeerId = 10022;
+        let credential_key = vec![9u8; 32];
+
+        let identity_type = DashMap::new();
+        identity_type.insert(from_peer_id, PeerIdentityType::SharedNode);
+        *route.service_impl.interface.lock().await = Some(Box::new(AuthOnlyInterface {
+            my_peer_id: peer_mgr.my_peer_id(),
+            identity_type,
+            peer_public_key: DashMap::new(),
+        }));
+
+        let mut sender_info = RoutePeerInfo::new();
+        sender_info.peer_id = from_peer_id;
+        sender_info.version = 1;
+
+        let mut forwarded_info = RoutePeerInfo::new();
+        forwarded_info.peer_id = forwarded_peer_id;
+        forwarded_info.version = 1;
+        forwarded_info.trusted_credential_pubkeys = vec![TrustedCredentialPubkeyProof {
+            credential: Some(TrustedCredentialPubkey {
+                pubkey: credential_key.clone(),
+                expiry_unix: i64::MAX,
+                ..Default::default()
+            }),
+            credential_hmac: vec![1; 32],
+        }];
+
+        let make_raw = |info: &RoutePeerInfo| {
+            let mut raw = DynamicMessage::new(RoutePeerInfo::default().descriptor());
+            raw.transcode_from(info).unwrap();
+            raw
+        };
+        let raw_infos = vec![make_raw(&sender_info), make_raw(&forwarded_info)];
+
+        route
+            .session_mgr
+            .do_sync_route_info(
+                from_peer_id,
+                1,
+                true,
+                Some(vec![sender_info, forwarded_info]),
+                Some(raw_infos),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!route
+            .service_impl
+            .synced_route_info
+            .trusted_credential_pubkeys
+            .contains_key(&credential_key));
+    }
+
+    #[tokio::test]
+    async fn clear_expired_peer_recomputes_trust_after_last_admin_disappears() {
+        let service_impl = PeerRouteServiceImpl::new(1, get_mock_global_ctx());
+        let admin_peer_id: PeerId = 10051;
+        let credential_peer_id: PeerId = 10052;
+        let admin_pubkey = vec![5u8; 32];
+        let credential_pubkey = vec![6u8; 32];
+        let network_name = service_impl
+            .global_ctx
+            .get_network_identity()
+            .network_name
+            .clone();
+        let now = SystemTime::now();
+        let closed_peers = Arc::new(Mutex::new(Vec::new()));
+
+        *service_impl.interface.lock().await = Some(Box::new(TrackingInterface {
+            my_peer_id: service_impl.my_peer_id,
+            closed_peers: closed_peers.clone(),
+        }));
+
+        {
+            let mut guard = service_impl.synced_route_info.peer_infos.write();
+
+            let mut admin_info = RoutePeerInfo::new();
+            admin_info.peer_id = admin_peer_id;
+            admin_info.version = 1;
+            admin_info.last_update =
+                Some((now - REMOVE_DEAD_PEER_INFO_AFTER - Duration::from_secs(1)).into());
+            admin_info.noise_static_pubkey = admin_pubkey;
+            admin_info.trusted_credential_pubkeys = vec![TrustedCredentialPubkeyProof {
+                credential: Some(TrustedCredentialPubkey {
+                    pubkey: credential_pubkey.clone(),
+                    expiry_unix: i64::MAX,
+                    ..Default::default()
+                }),
+                credential_hmac: vec![1; 32],
+            }];
+
+            let mut credential_info = RoutePeerInfo::new();
+            credential_info.peer_id = credential_peer_id;
+            credential_info.version = 1;
+            credential_info.last_update = Some(now.into());
+            credential_info.noise_static_pubkey = credential_pubkey.clone();
+
+            guard.insert(admin_peer_id, admin_info);
+            guard.insert(credential_peer_id, credential_info);
+        }
+
+        let (_, global_trusted_keys) = service_impl
+            .synced_route_info
+            .verify_and_update_credential_trusts(None);
+        service_impl
+            .global_ctx
+            .update_trusted_keys(global_trusted_keys, &network_name);
+
+        assert!(service_impl
+            .synced_route_info
+            .trusted_credential_pubkeys
+            .contains_key(&credential_pubkey));
+
+        service_impl.clear_expired_peer().await;
+
+        assert!(!service_impl.global_ctx.is_pubkey_trusted_with_source(
+            &credential_pubkey,
+            &network_name,
+            TrustedKeySource::OspfCredential,
+        ));
+        assert!(closed_peers.lock().contains(&credential_peer_id));
+        assert!(!service_impl
+            .synced_route_info
+            .peer_infos
+            .read()
+            .contains_key(&admin_peer_id));
+        assert!(!service_impl
+            .synced_route_info
+            .peer_infos
+            .read()
+            .contains_key(&credential_peer_id));
     }
 
     #[rstest::rstest]
@@ -3690,5 +4775,303 @@ mod tests {
 
         connect_peer_manager(p_b.clone(), p_c.clone()).await;
         wait_route_appear(p_a.clone(), p_c.clone()).await.unwrap();
+    }
+
+    /// Helper: create a raw DynamicMessage from a RoutePeerInfo with an extra
+    /// unknown field appended (field number 9999, varint value 42).
+    /// Returns the raw DynamicMessage and the encoded unknown field bytes.
+    fn make_raw_with_unknown_field(info: &RoutePeerInfo) -> (DynamicMessage, Vec<u8>) {
+        // Encode the info to bytes
+        let mut bytes = info.encode_to_vec();
+        // Append an unknown field: field 9999, wire type 0 (varint), value 42
+        // Tag = (9999 << 3) | 0 = 79992, encoded as varint
+        prost::encoding::encode_key(9999, prost::encoding::WireType::Varint, &mut bytes);
+        prost::encoding::encode_varint(42, &mut bytes);
+        let unknown_field_bytes = bytes[info.encoded_len()..].to_vec();
+        // Decode as DynamicMessage — unknown fields are preserved
+        let raw = DynamicMessage::decode(RoutePeerInfo::default().descriptor(), bytes.as_slice())
+            .unwrap();
+        (raw, unknown_field_bytes)
+    }
+
+    /// Check that a raw DynamicMessage still contains the unknown field bytes
+    /// by re-encoding and checking the suffix.
+    fn raw_has_unknown_bytes(raw: &DynamicMessage, unknown_bytes: &[u8]) -> bool {
+        let encoded = raw.encode_to_vec();
+        // The unknown field bytes should appear somewhere in the encoded output
+        encoded
+            .windows(unknown_bytes.len())
+            .any(|w| w == unknown_bytes)
+    }
+
+    #[tokio::test]
+    async fn sync_route_preserves_unknown_fields_for_credential_sender() {
+        let peer_mgr = create_mock_pmgr().await;
+        let route = create_mock_route(peer_mgr.clone()).await;
+        let from_peer_id: PeerId = 20001;
+        let credential_pubkey = vec![4u8; 32];
+
+        let identity_type = DashMap::new();
+        identity_type.insert(from_peer_id, PeerIdentityType::Credential);
+        let peer_public_key = DashMap::new();
+        peer_public_key.insert(from_peer_id, credential_pubkey.clone());
+        *route.service_impl.interface.lock().await = Some(Box::new(AuthOnlyInterface {
+            my_peer_id: peer_mgr.my_peer_id(),
+            identity_type,
+            peer_public_key,
+        }));
+        route
+            .service_impl
+            .synced_route_info
+            .trusted_credential_pubkeys
+            .insert(
+                credential_pubkey.clone(),
+                TrustedCredentialPubkey {
+                    pubkey: credential_pubkey,
+                    expiry_unix: i64::MAX,
+                    ..Default::default()
+                },
+            );
+
+        let mut sender_info = RoutePeerInfo::new();
+        sender_info.peer_id = from_peer_id;
+        sender_info.version = 1;
+
+        let (raw, unknown_bytes) = make_raw_with_unknown_field(&sender_info);
+
+        route
+            .session_mgr
+            .do_sync_route_info(
+                from_peer_id,
+                1,
+                true,
+                Some(vec![sender_info]),
+                Some(vec![raw]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let stored_raw = route
+            .service_impl
+            .synced_route_info
+            .raw_peer_infos
+            .get(&from_peer_id)
+            .expect("raw peer info should be stored");
+        assert!(
+            raw_has_unknown_bytes(stored_raw.value(), &unknown_bytes),
+            "unknown fields should be preserved for credential sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_route_preserves_unknown_fields_for_shared_sender() {
+        let peer_mgr = create_mock_pmgr().await;
+        let route = create_mock_route(peer_mgr.clone()).await;
+        let from_peer_id: PeerId = 20011;
+        let forwarded_peer_id: PeerId = 20012;
+
+        let identity_type = DashMap::new();
+        identity_type.insert(from_peer_id, PeerIdentityType::SharedNode);
+        *route.service_impl.interface.lock().await = Some(Box::new(AuthOnlyInterface {
+            my_peer_id: peer_mgr.my_peer_id(),
+            identity_type,
+            peer_public_key: DashMap::new(),
+        }));
+
+        let mut sender_info = RoutePeerInfo::new();
+        sender_info.peer_id = from_peer_id;
+        sender_info.version = 1;
+
+        let mut forwarded_info = RoutePeerInfo::new();
+        forwarded_info.peer_id = forwarded_peer_id;
+        forwarded_info.version = 1;
+        forwarded_info.trusted_credential_pubkeys = vec![TrustedCredentialPubkeyProof {
+            credential: Some(TrustedCredentialPubkey {
+                pubkey: vec![9u8; 32],
+                expiry_unix: i64::MAX,
+                ..Default::default()
+            }),
+            credential_hmac: vec![1; 32],
+        }];
+
+        let (raw_sender, unknown_sender) = make_raw_with_unknown_field(&sender_info);
+        let (raw_forwarded, unknown_forwarded) = make_raw_with_unknown_field(&forwarded_info);
+
+        route
+            .session_mgr
+            .do_sync_route_info(
+                from_peer_id,
+                1,
+                true,
+                Some(vec![sender_info, forwarded_info]),
+                Some(vec![raw_sender, raw_forwarded]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Shared node: trusted_credential_pubkeys cleared but unknown fields preserved
+        let stored_sender = route
+            .service_impl
+            .synced_route_info
+            .raw_peer_infos
+            .get(&from_peer_id)
+            .expect("sender raw should be stored");
+        assert!(
+            raw_has_unknown_bytes(stored_sender.value(), &unknown_sender),
+            "unknown fields should be preserved for shared sender's own info"
+        );
+
+        let stored_forwarded = route
+            .service_impl
+            .synced_route_info
+            .raw_peer_infos
+            .get(&forwarded_peer_id)
+            .expect("forwarded raw should be stored");
+        assert!(
+            raw_has_unknown_bytes(stored_forwarded.value(), &unknown_forwarded),
+            "unknown fields should be preserved for shared sender's forwarded info"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_route_preserves_unknown_fields_for_admin_sender() {
+        let peer_mgr = create_mock_pmgr().await;
+        let route = create_mock_route(peer_mgr.clone()).await;
+        let from_peer_id: PeerId = 20021;
+
+        let identity_type = DashMap::new();
+        identity_type.insert(from_peer_id, PeerIdentityType::Admin);
+        *route.service_impl.interface.lock().await = Some(Box::new(AuthOnlyInterface {
+            my_peer_id: peer_mgr.my_peer_id(),
+            identity_type,
+            peer_public_key: DashMap::new(),
+        }));
+
+        let mut sender_info = RoutePeerInfo::new();
+        sender_info.peer_id = from_peer_id;
+        sender_info.version = 1;
+        // Set is_credential_peer=true so the mark_credential_peer(false) path triggers
+        sender_info.feature_flag = Some(PeerFeatureFlag {
+            is_credential_peer: true,
+            ..Default::default()
+        });
+
+        let (raw, unknown_bytes) = make_raw_with_unknown_field(&sender_info);
+
+        route
+            .session_mgr
+            .do_sync_route_info(
+                from_peer_id,
+                1,
+                true,
+                Some(vec![sender_info]),
+                Some(vec![raw]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let stored_raw = route
+            .service_impl
+            .synced_route_info
+            .raw_peer_infos
+            .get(&from_peer_id)
+            .expect("raw peer info should be stored");
+        assert!(
+            raw_has_unknown_bytes(stored_raw.value(), &unknown_bytes),
+            "unknown fields should be preserved for admin sender (mark non-credential path)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_route_info_prioritizes_local_over_remote_for_overlapped_proxy_cidrs() {
+        let peer_mgr = create_mock_pmgr().await;
+        let route = create_mock_route(peer_mgr.clone()).await;
+        let from_peer_id: PeerId = 11001;
+
+        let peers = Arc::new(Mutex::new(vec![from_peer_id]));
+        let peer_identity_types = Arc::new(Mutex::new(HashMap::from([(
+            from_peer_id,
+            Some(PeerIdentityType::Admin),
+        )])));
+        *route.service_impl.interface.lock().await = Some(Box::new(CountingInterface {
+            my_peer_id: peer_mgr.my_peer_id(),
+            peers,
+            peer_identity_types,
+            list_peers_calls: Arc::new(AtomicU32::new(0)),
+            get_peer_identity_type_calls: Arc::new(AtomicU32::new(0)),
+        }));
+        route.service_impl.mark_interface_peers_dirty();
+        assert!(route.service_impl.update_my_conn_info().await);
+
+        route
+            .service_impl
+            .global_ctx
+            .config
+            .add_proxy_cidr("10.10.0.0/16".parse().unwrap(), None)
+            .unwrap();
+        assert!(route.service_impl.update_my_peer_info());
+
+        let mut sender_info = RoutePeerInfo::new();
+        sender_info.peer_id = from_peer_id;
+        sender_info.version = 1;
+        sender_info.proxy_cidrs = vec![
+            "10.10.0.0/16".to_string(),
+            "10.10.1.0/24".to_string(),
+            "10.11.0.0/16".to_string(),
+        ];
+
+        let make_raw = |info: &RoutePeerInfo| {
+            let mut raw = DynamicMessage::new(RoutePeerInfo::default().descriptor());
+            raw.transcode_from(info).unwrap();
+            raw
+        };
+
+        route
+            .session_mgr
+            .do_sync_route_info(
+                from_peer_id,
+                1,
+                true,
+                Some(vec![sender_info.clone()]),
+                Some(vec![make_raw(&sender_info)]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Keep route table in sync with interface-derived adjacency during assertion window.
+        route
+            .service_impl
+            .update_route_table_and_cached_local_conn_bitmap();
+
+        // Control plane: keep what remote announced.
+        let guard = route.service_impl.synced_route_info.peer_infos.read();
+        let stored = guard.get(&from_peer_id).unwrap();
+        assert_eq!(stored.proxy_cidrs, sender_info.proxy_cidrs);
+        drop(guard);
+
+        // Route-table filtering: local announced /16 should dominate remote equal/subset.
+        assert_eq!(
+            route
+                .service_impl
+                .route_table
+                .get_peer_id_for_proxy(&"10.10.1.1".parse::<IpAddr>().unwrap()),
+            Some(peer_mgr.my_peer_id())
+        );
+        // Non-overlapped remote prefix should still route to remote.
+        assert_eq!(
+            route
+                .service_impl
+                .route_table
+                .get_peer_id_for_proxy(&"10.11.0.1".parse::<IpAddr>().unwrap()),
+            Some(from_peer_id)
+        );
     }
 }

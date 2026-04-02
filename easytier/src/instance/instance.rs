@@ -34,7 +34,7 @@ use crate::gateway::kcp_proxy::{KcpProxyDst, KcpProxyDstRpcService, KcpProxySrc}
 use crate::gateway::quic_proxy::{QuicProxy, QuicProxyDstRpcService};
 use crate::gateway::tcp_proxy::{NatDstTcpConnector, TcpProxy, TcpProxyRpcService};
 use crate::gateway::udp_proxy::UdpProxy;
-use crate::peer_center::instance::PeerCenterInstance;
+use crate::peer_center::instance::{PeerCenterInstance, PeerCenterInstanceService};
 use crate::peers::peer_conn::PeerConnId;
 use crate::peers::peer_manager::{PeerManager, RouteAlgoType};
 #[cfg(feature = "tun")]
@@ -54,6 +54,7 @@ use crate::proto::api::instance::{
 };
 use crate::proto::api::manage::NetworkConfig;
 use crate::proto::common::{PortForwardConfigPb, TunnelInfo};
+use crate::proto::peer_rpc::PeerCenterRpc;
 use crate::proto::rpc_impl::standalone::RpcServerHook;
 use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
@@ -114,7 +115,10 @@ impl IpProxy {
             tracing::error!("start icmp proxy failed: {:?}", e);
             if cfg!(not(any(
                 target_os = "android",
-                target_os = "ios",
+                any(
+                    target_os = "ios",
+                    all(target_os = "macos", feature = "macos-ne")
+                ),
                 target_env = "ohos"
             ))) {
                 // android, ios and ohos not support icmp proxy
@@ -589,9 +593,12 @@ impl Instance {
         let mut direct_conn_manager =
             DirectConnectorManager::new(global_ctx.clone(), peer_manager.clone());
         direct_conn_manager.run();
+        let direct_conn_manager = Arc::new(direct_conn_manager);
 
-        let udp_hole_puncher = UdpHolePunchConnector::new(peer_manager.clone());
-        let tcp_hole_puncher = TcpHolePunchConnector::new(peer_manager.clone());
+        let udp_hole_puncher =
+            Arc::new(Mutex::new(UdpHolePunchConnector::new(peer_manager.clone())));
+        let tcp_hole_puncher =
+            Arc::new(Mutex::new(TcpHolePunchConnector::new(peer_manager.clone())));
 
         let peer_center = Arc::new(PeerCenterInstance::new(peer_manager.clone()));
 
@@ -614,9 +621,9 @@ impl Instance {
             peer_manager,
             listener_manager,
             conn_manager,
-            direct_conn_manager: Arc::new(direct_conn_manager),
-            udp_hole_puncher: Arc::new(Mutex::new(udp_hole_puncher)),
-            tcp_hole_puncher: Arc::new(Mutex::new(tcp_hole_puncher)),
+            direct_conn_manager,
+            udp_hole_puncher,
+            tcp_hole_puncher,
 
             ip_proxy: None,
             #[cfg(feature = "kcp")]
@@ -801,10 +808,7 @@ impl Instance {
                         continue;
                     }
 
-                    #[cfg(all(
-                        not(any(target_os = "android", target_os = "ios", target_env = "ohos")),
-                        feature = "tun"
-                    ))]
+                    #[cfg(all(not(mobile), feature = "tun"))]
                     {
                         let mut new_nic_ctx = NicCtx::new(
                             global_ctx_c.clone(),
@@ -845,10 +849,7 @@ impl Instance {
         });
     }
 
-    #[cfg(all(
-        not(any(target_os = "android", target_os = "ios", target_env = "ohos")),
-        feature = "tun"
-    ))]
+    #[cfg(all(not(mobile), feature = "tun"))]
     fn check_for_static_ip(&self, first_round_output: oneshot::Sender<Result<(), Error>>) {
         let ipv4_addr = self.global_ctx.get_ipv4();
         let ipv6_addr = self.global_ctx.get_ipv6();
@@ -936,7 +937,7 @@ impl Instance {
         {
             Self::clear_nic_ctx(self.nic_ctx.clone(), self.peer_packet_receiver.clone()).await;
 
-            #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
+            #[cfg(not(mobile))]
             if !self.global_ctx.config.get_flags().no_tun {
                 let (output_tx, output_rx) = oneshot::channel();
                 self.check_for_static_ip(output_tx);
@@ -1299,6 +1300,8 @@ impl Instance {
             port_forward_manage_rpc_service: F,
             stats_rpc_service: G,
             config_rpc_service: H,
+            peer_center_rpc_service: Arc<PeerCenterInstanceService>,
+            credential_manage_rpc_service: PeerManagerRpcService,
         }
 
         #[async_trait::async_trait]
@@ -1360,6 +1363,18 @@ impl Instance {
             fn get_config_service(&self) -> &dyn ConfigRpc<Controller = BaseController> {
                 &self.config_rpc_service
             }
+
+            fn get_peer_center_service(
+                &self,
+            ) -> Arc<dyn PeerCenterRpc<Controller = BaseController> + Send + Sync> {
+                self.peer_center_rpc_service.clone()
+            }
+
+            fn get_credential_manage_service(
+                &self,
+            ) -> &dyn CredentialManageRpc<Controller = BaseController> {
+                &self.credential_manage_rpc_service
+            }
         }
 
         ApiRpcServiceImpl {
@@ -1420,6 +1435,8 @@ impl Instance {
             port_forward_manage_rpc_service: self.get_port_forward_manager_rpc_service(),
             stats_rpc_service: self.get_stats_rpc_service(),
             config_rpc_service: self.get_config_service(),
+            peer_center_rpc_service: Arc::new(self.peer_center.get_rpc_service()),
+            credential_manage_rpc_service: PeerManagerRpcService::new(self.peer_manager.clone()),
         }
     }
 
@@ -1440,7 +1457,7 @@ impl Instance {
         self.peer_packet_receiver.clone()
     }
 
-    #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
+    #[cfg(mobile)]
     pub async fn setup_nic_ctx_for_mobile(
         nic_ctx: ArcNicCtx,
         global_ctx: ArcGlobalCtx,

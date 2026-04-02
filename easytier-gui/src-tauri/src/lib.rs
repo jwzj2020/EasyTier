@@ -14,7 +14,10 @@ use easytier::rpc_service::remote_client::{
 };
 use easytier::web_client::{self, WebClient};
 use easytier::{
-    common::config::{ConfigLoader, FileLoggerConfig, LoggingConfigBuilder, TomlConfigLoader},
+    common::{
+        config::{ConfigLoader, FileLoggerConfig, LoggingConfigBuilder, TomlConfigLoader},
+        log,
+    },
     instance_manager::NetworkInstanceManager,
     launcher::NetworkConfig,
     rpc_service::ApiRpcServer,
@@ -143,7 +146,6 @@ async fn collect_network_info(
 
 #[tauri::command]
 async fn set_logging_level(level: String) -> Result<(), String> {
-    println!("Setting logging level to: {}", level);
     get_client_manager!()?
         .set_logging_level(level.clone())
         .await
@@ -188,7 +190,7 @@ async fn remove_network_instance(app: AppHandle, instance_id: String) -> Result<
         .await
         .map_err(|e| e.to_string())?;
     client_manager
-        .post_remove_network_instances_hook(&app, &[instance_id])
+        .post_stop_network_instances_hook(&app)
         .await?;
 
     Ok(())
@@ -204,6 +206,16 @@ async fn update_network_config_state(
         .parse()
         .map_err(|e: uuid::Error| e.to_string())?;
     let client_manager = get_client_manager!()?;
+    if !disabled {
+        let cfg = client_manager
+            .handle_get_network_config(app.clone(), instance_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let toml_config = cfg.gen_config().map_err(|e| e.to_string())?;
+        client_manager
+            .pre_run_network_instance_hook(&app, &toml_config)
+            .await?;
+    }
     client_manager
         .handle_update_network_state(app.clone(), instance_id, disabled)
         .await
@@ -211,7 +223,11 @@ async fn update_network_config_state(
 
     if disabled {
         client_manager
-            .post_remove_network_instances_hook(&app, &[instance_id])
+            .post_stop_network_instances_hook(&app)
+            .await?;
+    } else {
+        client_manager
+            .post_run_network_instance_hook(&app, &instance_id)
             .await?;
     }
 
@@ -469,11 +485,17 @@ async fn init_web_client(app: AppHandle, url: Option<String>) -> Result<(), Stri
 
     let hooks = Arc::new(manager::GuiHooks { app: app.clone() });
 
-    let web_client =
-        web_client::run_web_client(url.as_str(), None, None, instance_manager, Some(hooks))
-            .await
-            .with_context(|| "Failed to initialize web client")
-            .map_err(|e| format!("{:#}", e))?;
+    let web_client = web_client::run_web_client(
+        url.as_str(),
+        None,
+        None,
+        false,
+        instance_manager,
+        Some(hooks),
+    )
+    .await
+    .with_context(|| "Failed to initialize web client")
+    .map_err(|e| format!("{:#}", e))?;
     *web_client_guard = Some(web_client);
     Ok(())
 }
@@ -513,23 +535,26 @@ async fn get_log_dir_path(app: tauri::AppHandle) -> Result<String, String> {
 #[cfg(not(target_os = "android"))]
 fn toggle_window_visibility(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let visible = if window.is_visible().unwrap_or_default() {
-            if window.is_minimized().unwrap_or_default() {
-                let _ = window.unminimize();
-                false
-            } else {
-                true
+        let visible = window.is_visible().unwrap_or_default();
+        let minimized = window.is_minimized().unwrap_or_default();
+        let focused = window.is_focused().unwrap_or_default();
+
+        let should_show = !visible || minimized || !focused;
+        if should_show {
+            if !visible {
+                let _ = window.show();
             }
+            if minimized {
+                let _ = window.unminimize();
+            }
+            if !focused {
+                let _ = window.set_focus();
+            }
+            let _ = set_dock_visibility(app.clone(), true);
         } else {
-            let _ = window.show();
-            false
-        };
-        if visible {
             let _ = window.hide();
-        } else {
-            let _ = window.set_focus();
+            let _ = set_dock_visibility(app.clone(), false);
         }
-        let _ = set_dock_visibility(app.clone(), !visible);
     }
 }
 
@@ -601,7 +626,7 @@ mod manager {
         async fn post_remove_network_instances(&self, ids: &[uuid::Uuid]) -> Result<(), String> {
             let client_manager = get_client_manager!()?;
             client_manager
-                .post_remove_network_instances_hook(&self.app, ids)
+                .post_remote_remove_network_instances_hook(&self.app, ids)
                 .await
         }
     }
@@ -684,7 +709,9 @@ mod manager {
                 self.network_configs.remove(network_inst_id);
                 self.enabled_networks.remove(network_inst_id);
             }
-            self.save_configs(&app)
+            self.save_configs(&app)?;
+            self.save_enabled_networks(&app)?;
+            Ok(())
         }
 
         async fn update_network_config_state(
@@ -817,7 +844,7 @@ mod manager {
             cfg: &easytier::common::config::TomlConfigLoader,
         ) -> Result<(), String> {
             let instance_id = cfg.get_id();
-            app.emit("pre_run_network_instance", instance_id)
+            app.emit("pre_run_network_instance", instance_id.to_string())
                 .map_err(|e| e.to_string())?;
 
             #[cfg(target_os = "android")]
@@ -854,20 +881,21 @@ mod manager {
                         let app_clone = app.clone();
                         let instance_id_clone = *instance_id;
                         tokio::spawn(async move {
+                            let instance_id_str = instance_id_clone.to_string();
                             loop {
                                 match event_receiver.recv().await {
                                     Ok(easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv4Changed(_, _)) => {
-                                        let _ = app_clone.emit("dhcp_ip_changed", instance_id_clone);
+                                        let _ = app_clone.emit("dhcp_ip_changed", &instance_id_str);
                                     }
                                     Ok(easytier::common::global_ctx::GlobalCtxEvent::ProxyCidrsUpdated(_, _)) => {
-                                        let _ = app_clone.emit("proxy_cidrs_updated", instance_id_clone);
+                                        let _ = app_clone.emit("proxy_cidrs_updated", &instance_id_str);
                                     }
                                     Ok(_) => {}
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                         break;
                                     }
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                        let _ = app_clone.emit("event_lagged", instance_id_clone);
+                                        let _ = app_clone.emit("event_lagged", &instance_id_str);
                                         event_receiver = event_receiver.resubscribe();
                                     }
                                 }
@@ -879,20 +907,29 @@ mod manager {
 
             self.storage.enabled_networks.insert(*instance_id);
 
-            app.emit("post_run_network_instance", instance_id)
+            app.emit("post_run_network_instance", instance_id.to_string())
                 .map_err(|e| e.to_string())?;
 
             Ok(())
         }
 
-        pub(super) async fn post_remove_network_instances_hook(
+        pub(super) async fn post_remote_remove_network_instances_hook(
             &self,
             app: &AppHandle,
-            _ids: &[uuid::Uuid],
+            ids: &[uuid::Uuid],
         ) -> Result<(), String> {
             self.storage
-                .enabled_networks
-                .retain(|id| !_ids.contains(id));
+                .delete_network_configs(app.clone(), ids)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.notify_vpn_stop_if_no_tun(app)?;
+            Ok(())
+        }
+
+        pub(super) async fn post_stop_network_instances_hook(
+            &self,
+            app: &AppHandle,
+        ) -> Result<(), String> {
             self.notify_vpn_stop_if_no_tun(app)?;
             Ok(())
         }
@@ -949,20 +986,26 @@ mod manager {
                             .network_configs
                             .get(&uuid)
                             .map(|i| i.value().1.clone());
-                        if config.is_none() {
+                        let Some(config) = config else {
                             continue;
-                        }
+                        };
+                        let toml_config = config.gen_config()?;
+                        self.pre_run_network_instance_hook(&app, &toml_config)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?;
                         client
                             .run_network_instance(
                                 BaseController::default(),
                                 RunNetworkInstanceRequest {
                                     inst_id: None,
-                                    config,
+                                    config: Some(config),
                                     overwrite: false,
                                 },
                             )
                             .await?;
-                        self.storage.enabled_networks.insert(uuid);
+                        self.post_run_network_instance_hook(&app, &uuid)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?;
                     }
                 }
             }
@@ -1116,7 +1159,7 @@ pub fn run_gui() -> std::process::ExitCode {
                 })
                 .build()
                 .map_err(|e| e.to_string())?;
-            let Ok(_) = utils::init_logger(&config, true) else {
+            let Ok(_) = log::init(&config, true) else {
                 return Ok(());
             };
 

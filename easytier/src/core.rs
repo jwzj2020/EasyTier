@@ -10,11 +10,12 @@ use std::{
 use crate::{
     common::{
         config::{
-            get_avaliable_encrypt_methods, load_config_from_file, ConfigFileControl, ConfigLoader,
-            ConsoleLoggerConfig, FileLoggerConfig, LoggingConfigLoader, NetworkIdentity,
-            PeerConfig, PortForwardConfig, TomlConfigLoader, VpnPortalConfig,
+            load_config_from_file, process_secure_mode_cfg, ConfigFileControl, ConfigLoader,
+            ConsoleLoggerConfig, EncryptionAlgorithm, FileLoggerConfig, LoggingConfigLoader,
+            NetworkIdentity, PeerConfig, PortForwardConfig, TomlConfigLoader, VpnPortalConfig,
         },
         constants::EASYTIER_VERSION,
+        log,
     },
     defer,
     instance_manager::NetworkInstanceManager,
@@ -22,14 +23,12 @@ use crate::{
     proto::common::{CompressionAlgoPb, SecureModeConfig},
     rpc_service::ApiRpcServer,
     tunnel::PROTO_PORT_OFFSET,
-    utils::{init_logger, setup_panic_handler},
+    utils::setup_panic_handler,
     web_client, ShellType,
 };
 use anyhow::Context;
-use base64::{prelude::BASE64_STANDARD, Engine as _};
 use cidr::IpCidr;
 use clap::{CommandFactory, Parser};
-use rand::rngs::OsRng;
 use rust_i18n::t;
 use tokio::io::AsyncReadExt;
 
@@ -277,9 +276,9 @@ struct NetworkOptions {
         long,
         env = "ET_ENCRYPTION_ALGORITHM",
         help = t!("core_clap.encryption_algorithm").to_string(),
-        value_parser = get_avaliable_encrypt_methods()
+        value_enum,
     )]
-    encryption_algorithm: Option<String>,
+    encryption_algorithm: Option<EncryptionAlgorithm>,
 
     #[arg(
         long,
@@ -406,6 +405,15 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_LAZY_P2P",
+        help = t!("core_clap.lazy_p2p").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    lazy_p2p: Option<bool>,
+
+    #[arg(
+        long,
         env = "ET_DISABLE_P2P",
         help = t!("core_clap.disable_p2p").to_string(),
         num_args = 0..=1,
@@ -448,6 +456,15 @@ struct NetworkOptions {
         default_missing_value = "true"
     )]
     relay_all_peer_rpc: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_NEED_P2P",
+        help = t!("core_clap.need_p2p").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    need_p2p: Option<bool>,
 
     #[cfg(feature = "socks5")]
     #[arg(
@@ -545,6 +562,13 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_INSTANCE_RECV_BPS_LIMIT",
+        help = t!("core_clap.instance_recv_bps_limit").to_string(),
+    )]
+    instance_recv_bps_limit: Option<u64>,
+
+    #[arg(
+        long,
         value_delimiter = ',',
         help = t!("core_clap.tcp_whitelist").to_string(),
         num_args = 0..
@@ -635,6 +659,20 @@ struct NetworkOptions {
         help = t!("core_clap.local_public_key").to_string()
     )]
     local_public_key: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_CREDENTIAL",
+        help = t!("core_clap.credential").to_string()
+    )]
+    credential: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_CREDENTIAL_FILE",
+        help = t!("core_clap.credential_file").to_string()
+    )]
+    credential_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -758,42 +796,6 @@ impl NetworkOptions {
         false
     }
 
-    fn process_secure_mode_cfg(mut user_cfg: SecureModeConfig) -> anyhow::Result<SecureModeConfig> {
-        if !user_cfg.enabled {
-            return Ok(user_cfg);
-        }
-
-        let private_key = if user_cfg.local_private_key.is_none() {
-            // if no private key, generate random one
-            let private = x25519_dalek::StaticSecret::random_from_rng(OsRng);
-            user_cfg.local_private_key = Some(BASE64_STANDARD.encode(private.clone().as_bytes()));
-            private
-        } else {
-            // check if private key is valid
-            user_cfg.private_key()?
-        };
-
-        let public = x25519_dalek::PublicKey::from(&private_key);
-
-        match user_cfg.local_public_key {
-            None => {
-                user_cfg.local_public_key = Some(BASE64_STANDARD.encode(public.as_bytes()));
-            }
-            Some(ref user_pub) => {
-                let public = user_cfg.public_key()?;
-                if *user_pub != BASE64_STANDARD.encode(public.as_bytes()) {
-                    return Err(anyhow::anyhow!(
-                        "local public key {} does not match generated public key {}",
-                        user_pub,
-                        BASE64_STANDARD.encode(public.as_bytes())
-                    ));
-                }
-            }
-        }
-
-        Ok(user_cfg)
-    }
-
     fn merge_into(&self, cfg: &TomlConfigLoader) -> anyhow::Result<()> {
         if self.hostname.is_some() {
             cfg.set_hostname(self.hostname.clone());
@@ -801,11 +803,17 @@ impl NetworkOptions {
 
         let old_ns = cfg.get_network_identity();
         let network_name = self.network_name.clone().unwrap_or(old_ns.network_name);
-        let network_secret = self
-            .network_secret
-            .clone()
-            .unwrap_or(old_ns.network_secret.unwrap_or_default());
-        cfg.set_network_identity(NetworkIdentity::new(network_name, network_secret));
+
+        if self.credential.is_some() {
+            // Credential mode: no network_secret, authenticate via credential keypair
+            cfg.set_network_identity(NetworkIdentity::new_credential(network_name));
+        } else {
+            let network_secret = self
+                .network_secret
+                .clone()
+                .unwrap_or(old_ns.network_secret.unwrap_or_default());
+            cfg.set_network_identity(NetworkIdentity::new(network_name, network_secret));
+        }
 
         if let Some(dhcp) = self.dhcp {
             cfg.set_dhcp(dhcp);
@@ -974,14 +982,26 @@ impl NetworkOptions {
             cfg.set_port_forwards(old);
         }
 
-        if let Some(secure_mode) = self.secure_mode {
+        if let Some(ref credential_file) = self.credential_file {
+            cfg.set_credential_file(Some(credential_file.clone()));
+        }
+
+        if let Some(ref credential_secret) = self.credential {
+            // --credential implies --secure-mode and sets the credential private key
+            let c = SecureModeConfig {
+                enabled: true,
+                local_private_key: Some(credential_secret.clone()),
+                local_public_key: None,
+            };
+            cfg.set_secure_mode(Some(process_secure_mode_cfg(c)?));
+        } else if let Some(secure_mode) = self.secure_mode {
             if secure_mode {
                 let c = SecureModeConfig {
                     enabled: secure_mode,
                     local_private_key: self.local_private_key.clone(),
                     local_public_key: self.local_public_key.clone(),
                 };
-                cfg.set_secure_mode(Some(Self::process_secure_mode_cfg(c)?));
+                cfg.set_secure_mode(Some(process_secure_mode_cfg(c)?));
             }
         }
 
@@ -993,7 +1013,7 @@ impl NetworkOptions {
             f.enable_encryption = !v;
         }
         if let Some(algorithm) = &self.encryption_algorithm {
-            f.encryption_algorithm = algorithm.clone();
+            f.encryption_algorithm = algorithm.to_string();
         }
         if let Some(v) = self.disable_ipv6 {
             f.enable_ipv6 = !v;
@@ -1016,6 +1036,7 @@ impl NetworkOptions {
         }
         f.disable_p2p = self.disable_p2p.unwrap_or(f.disable_p2p);
         f.p2p_only = self.p2p_only.unwrap_or(f.p2p_only);
+        f.lazy_p2p = self.lazy_p2p.unwrap_or(f.lazy_p2p);
         f.disable_tcp_hole_punching = self
             .disable_tcp_hole_punching
             .unwrap_or(f.disable_tcp_hole_punching);
@@ -1023,6 +1044,7 @@ impl NetworkOptions {
             .disable_udp_hole_punching
             .unwrap_or(f.disable_udp_hole_punching);
         f.relay_all_peer_rpc = self.relay_all_peer_rpc.unwrap_or(f.relay_all_peer_rpc);
+        f.need_p2p = self.need_p2p.unwrap_or(f.need_p2p);
         f.multi_thread = self.multi_thread.unwrap_or(f.multi_thread);
         if let Some(compression) = &self.compression {
             f.data_compress_algo = match compression.as_str() {
@@ -1045,6 +1067,9 @@ impl NetworkOptions {
         f.foreign_relay_bps_limit = self
             .foreign_relay_bps_limit
             .unwrap_or(f.foreign_relay_bps_limit);
+        f.instance_recv_bps_limit = self
+            .instance_recv_bps_limit
+            .unwrap_or(f.instance_recv_bps_limit);
         f.multi_thread_count = self.multi_thread_count.unwrap_or(f.multi_thread_count);
         f.disable_relay_kcp = self.disable_relay_kcp.unwrap_or(f.disable_relay_kcp);
         f.disable_relay_quic = self.disable_relay_quic.unwrap_or(f.disable_relay_quic);
@@ -1163,7 +1188,7 @@ fn win_service_event_loop(
                         }
                         Err(e) => {
                             status_handle.set_service_status(error_status).unwrap();
-                            eprintln!("error: {}", e);
+                            log::error!("{}", e);
                         }
                     }
                 },
@@ -1231,7 +1256,7 @@ fn win_service_main(arg: Vec<std::ffi::OsString>) {
 
 async fn run_main(cli: Cli) -> anyhow::Result<()> {
     defer!(dump_profile(0););
-    init_logger(&cli.logging_options, true)?;
+    log::init(&cli.logging_options, true)?;
 
     let manager = Arc::new(NetworkInstanceManager::new().with_config_path(cli.config_dir.clone()));
 
@@ -1248,17 +1273,18 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             config_server_url_s,
             cli.machine_id.clone(),
             cli.network_options.hostname.clone(),
+            cli.network_options.secure_mode.unwrap_or(false),
             manager.clone(),
             None,
         )
         .await
         .inspect(|_| {
-            println!(
-                "Web client started successfully...\nserver: {}",
-                config_server_url_s,
+            log::info!(
+                server = config_server_url_s,
+                "Web client started successfully...",
             );
 
-            println!("Official config website: https://easytier.cn/web");
+            log::info!("Official config website: https://easytier.cn/web");
         })?;
 
         Some(wc)
@@ -1324,13 +1350,17 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             control.set_no_delete(true);
         }
 
-        println!(
-            "Starting easytier from config file {:?}({:?}) with config:",
-            config_file, control.permission
+        log::info!(
+            "\
+            Starting easytier from config file {:?}({:?}) with config:\n\
+            ############### TOML ###############\n\
+            {}\n\
+            -----------------------------------\n\
+            ",
+            config_file,
+            control.permission,
+            cfg.dump()
         );
-        println!("############### TOML ###############\n");
-        println!("{}", cfg.dump());
-        println!("-----------------------------------");
         manager.run_network_instance(cfg, true, control)?;
     }
 
@@ -1339,10 +1369,15 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
         cli.network_options
             .merge_into(&cfg)
             .with_context(|| "failed to create config from cli".to_string())?;
-        println!("Starting easytier from cli with config:");
-        println!("############### TOML ###############\n");
-        println!("{}", cfg.dump());
-        println!("-----------------------------------");
+        log::info!(
+            "\
+            Starting easytier from cli with config:\n\
+            ############### TOML ###############\n\
+            {}\n\
+            -----------------------------------\n\
+            ",
+            cfg.dump()
+        );
         manager.run_network_instance(cfg, true, ConfigFileControl::STATIC_CONFIG)?;
     }
 
@@ -1363,11 +1398,11 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            println!("ctrl-c received, exiting...");
+            log::info!("ctrl-c received, exiting...");
         }
 
         _ = sigterm, if cfg!(unix) => {
-            println!("terminate signal received, exiting...");
+            log::warn!("terminate signal received, exiting...");
         }
     }
     Ok(())
@@ -1384,11 +1419,7 @@ fn memory_monitor(_force_dump: Arc<AtomicBool>) {
             e.advance().unwrap();
             let new_heap_size = allocated_stats.read().unwrap();
 
-            println!(
-                "heap size: {} bytes, time: {}",
-                new_heap_size,
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-            );
+            log::debug!("heap size: {} bytes", new_heap_size);
 
             // dump every 75MB
             if (last_peak_size > 0
@@ -1396,10 +1427,9 @@ fn memory_monitor(_force_dump: Arc<AtomicBool>) {
                 && new_heap_size - last_peak_size > 10 * 1024 * 1024)
                 || _force_dump.load(std::sync::atomic::Ordering::Relaxed)
             {
-                println!(
-                    "heap size increased: {} bytes, time: {}",
+                log::debug!(
+                    "heap size increased: {} bytes",
                     new_heap_size - last_peak_size,
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
                 );
                 dump_profile(new_heap_size);
                 last_peak_size = new_heap_size;
@@ -1475,7 +1505,7 @@ pub async fn main() -> ExitCode {
     // Verify configurations
     if cli.check_config {
         if let Err(e) = validate_config(&cli).await {
-            eprintln!("Config validation failed: {:?}", e);
+            log::error!("Config validation failed: {:?}", e);
             return ExitCode::FAILURE;
         } else {
             return ExitCode::SUCCESS;
@@ -1484,12 +1514,12 @@ pub async fn main() -> ExitCode {
 
     let mut ret_code = 0;
 
-    if let Err(e) = run_main(cli).await {
-        eprintln!("error: {:?}", e);
+    if let Err(error) = run_main(cli).await {
+        log::error!(%error);
         ret_code = 1;
     }
 
-    println!("Stopping easytier...");
+    log::info!("Stopping easytier...");
     set_prof_active(false);
 
     ExitCode::from(ret_code)

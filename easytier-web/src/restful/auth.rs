@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::restful::users::Backend;
 
+use std::sync::Arc;
+
+use crate::FeatureFlags;
+
 use super::{
     users::{AuthSession, Credentials},
     AppStateInner,
@@ -67,7 +71,7 @@ mod put {
 }
 
 mod post {
-    use axum::Json;
+    use axum::{extract::Extension, Json};
     use easytier::proto::common::Void;
 
     use crate::restful::{
@@ -110,10 +114,20 @@ mod post {
     }
 
     pub async fn register(
+        Extension(feature_flags): Extension<Arc<FeatureFlags>>,
         auth_session: AuthSession,
         captcha_session: tower_sessions::Session,
         Json(req): Json<RegisterNewUser>,
     ) -> Result<Json<Void>, HttpHandleError> {
+        // Check if registration is disabled
+        if feature_flags.disable_registration {
+            tracing::warn!("Registration attempt blocked: registration is disabled");
+            return Err((
+                StatusCode::FORBIDDEN,
+                other_error("Registration is disabled").into(),
+            ));
+        }
+
         // 调用CaptchaUtil的静态方法验证验证码是否正确
         if !CaptchaUtil::ver(&req.captcha, &captcha_session).await {
             return Err((
